@@ -38,7 +38,8 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 握手層採用嚴格的**固定長度無前綴 (Fixed-Length, Prefix-Free)** 密文設計。
 
 ### 3.1 握手請求 (Client -> Server)
-客戶端發送 Noise `IK` 模式的第一條訊息 (`-> e, es, s, ss`)。
+客戶端發送 Noise `NK` 模式（或等效的單向靜態公鑰認證模式）的第一條訊息。
+在此模型中，**客戶端預先知道伺服器的靜態公鑰 (Server Static Key)，但伺服器不預先知道客戶端的身份**。
 
 **1. 構造明文 Payload (64 Bytes 固定長度):**
 ```text
@@ -49,26 +50,26 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 * `Version`: 必須為 `0x01`。
 * `Caps`: 能力位元遮罩，目前保留為 `0x00000000`。
 
-**2. 生成網路上傳輸的密文 (160 Bytes 固定長度):**
-Noise `IK` 產生的二進位序列：
+**2. 生成網路上傳輸的密文 (112 Bytes 固定長度):**
+基於 Noise `NK` 產生的二進位序列：
 * `e` (Ephemeral Pubkey): 32 Bytes
-* `s` (Static Pubkey Ciphertext): 32 Bytes + 16 Bytes MAC = 48 Bytes
 * `payload` (Payload Ciphertext): 64 Bytes + 16 Bytes MAC = 80 Bytes
-**總長度**: `32 + 48 + 80 = 160 Bytes`。
+*(註：此長度僅為概念計算，實際採用 `NK` 模式時，首包長度可能不同，核心約束是**長度必須固定不變**)*
 
-**伺服器行為**: 伺服器從位元組流中精確讀取 160 Bytes。如果 AEAD 認證失敗，**必須 (MUST)** 停止 Chameleon 解析，並將此流交由 Fallback 處理，**絕對不可 (MUST NOT)** 返回任何錯誤。
+**伺服器行為**: 伺服器從位元組流中精確讀取規定長度的 Bytes。如果 AEAD 認證失敗，**必須 (MUST) 保持絕對靜默 (Silent Drop)**。這表示伺服器可選擇直接中斷底層連線（如 TCP RST），或將流靜默轉交給本機服務（Fallback），但**絕對不可 (MUST NOT)** 返回任何 Chameleon 錯誤幀。
 
 ### 3.2 握手回應 (Server -> Client)
-伺服器發送 Noise `IK` 模式的第二條訊息 (`<- e, ee, se`)。
+伺服器發送 Noise 的第二條訊息。
 
 **1. 預簽發紀元憑證 (Epoch Cert) 結構 (112 Bytes):**
 ```text
 +-----------------------------------+-----------------------------------+
-| Server Static Pubkey (32 bytes)   | Not_Before_UTC (8 bytes, 秒數)    |
+| Server Static Pubkey (32 bytes)   | Epoch_Window_Start (8 bytes, 秒數)|
 +-----------------------------------+-----------------------------------+
-| Not_After_UTC (8 bytes, 秒數)     | Ed25519 Control Plane Sig (64 b)  |
+| Epoch_Window_End (8 bytes, 秒數)  | Ed25519 Control Plane Sig (64 b)  |
 +-----------------------------------+-----------------------------------+
 ```
+*(註：不再將此視為時鐘校準工具，而是作為重放防護的新鮮度 (Freshness) 視窗)*
 
 **2. 構造明文 Payload (128 Bytes 固定長度):**
 ```text
