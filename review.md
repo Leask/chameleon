@@ -1,494 +1,469 @@
 # Chameleon 聯合審查報告
-*(本輪重點：細拆每個修改點，保留已被合理解決的問題，只攻擊仍未閉環的核心結構)*
+*(本輪重點：承認已修掉的大洞，轉向更細的控制面、record 完整性、pool 契約與長連線語義)*
 
 ## 0. 總體判斷
 
-這一輪和前幾輪不一樣。你們已經開始真正修 wire-level 問題，而不是只在
-高層設計上換措辭。這是實質進展。
+這一輪的質量比前幾輪高很多。你們不只是修文案，而是真的開始把核心閉環補上：
 
-但進展越深，問題也越集中。現在真正阻塞落地的，不再是「還缺幀」，
-而是以下四條主線：
+- `NK` 的前置公鑰前提被正式承認
+- 兩級 PKI 已經進入設計與協議
+- `Epoch Cert` 已開始有 verifier algorithm
+- `Auth Scheme 0x01` 已有 domain separation
+- `Channel ID` exhaustion 已開始被當作長連線問題處理
 
-- 控制面信任鏈還沒有變成真正可運作的簽發體系
-- record layer 還沒有完成最後一層完整性綁定
-- `Session Pool` 被提出來了，但還只是願景，不是可執行架構
-- auth / recovery / rotation 仍然缺少幾個會直接影響實作一致性的硬規則
-
-下面我按這個順序展開。
+所以這一輪我不再重複打那些已經收斂的舊點。我只保留當前版本仍然會阻塞
+「穩定實作、可運維、可規模化」的問題，而且每個點都直接給出修改方向。
 
 ## 1. 阻塞級問題
 
-### 1. Root CA 離線與 `Epoch Cert` 直接由 Root 驗證，這兩件事互相衝突
+### 1. `Epoch Cert` 的兩級 PKI 方向對了，但 `CPSK` 鏈條還沒有被定義成真正可運作的物件
 
 #### 問題本身
 
-`design.md` 明確寫：
+你們這一輪正式引入了兩級 PKI：
 
-- Root CA 絕對離線
-- 控制面負責簽發 `Epoch Cert`
-
-[design.md:41](/Users/leask/Documents/chameleon/design.md:41)
-
-但 `protocol.md` 的 `Epoch Cert Verification Algorithm` 又寫成：
-
-- client 用 Root CA 的 Ed25519 公鑰直接驗證 `Epoch Cert` 上的簽名
-
-[protocol.md:109](/Users/leask/Documents/chameleon/protocol.md:109)
-[protocol.md:112](/Users/leask/Documents/chameleon/protocol.md:112)
-
-這代表現在的 wire spec 等價於：
-
-- Root CA 直接簽短期 edge key
-
-這和你們自己的信任模型相衝突。Root 一旦真離線，就不可能持續為
-24 小時級別的短期 edge key 做線上簽發。
-
-#### 為什麼這不是小問題
-
-如果你們不修這條鏈，後面所有關於：
-
-- signer rotation
-- config refresh
-- edge key 短期化
-- 大規模節點滾動更新
-
-都會變成自相矛盾。
-
-這不是文檔表述問題，是控制面架構沒有落地。
-
-#### 建議怎麼改
-
-最直接的可行方案是引入兩級簽發：
-
-1. `Root CA` 只離線簽發 `Control Plane Signing Key Certificate`
-2. 線上控制面持有短期 `CPSK`，由它來簽 `Epoch Cert`
-
-建議新增的信任鏈物件：
-
-- `Root Public Key`
-  由 client OOB 固定釘住
-- `CPSK Certificate`
-  內容至少包含：
-  - `Signer Public Key`
-  - `Signer Key ID`
-  - `NotBefore`
-  - `NotAfter`
-  - `Signature by Root`
-- `Epoch Cert`
-  內容至少包含：
-  - `Server Static Pubkey`
-  - `Epoch Window Start`
-  - `Epoch Window End`
-  - `Signer Key ID`
-  - `Signature by CPSK`
-
-對應 verifier algorithm 應改成：
-
-1. 用 Root 驗證 `CPSK Certificate`
-2. 檢查 `CPSK` 是否在有效期
-3. 用 `CPSK` 驗證 `Epoch Cert`
-4. 再做 responder key binding 與 freshness 驗證
-
-如果你們想更進一步減少 bundle 更新成本，還應加：
-
-- `CPSK overlap period`
-- `current + next signer` 雙簽發窗口
-
-不然 signer 輪換會直接變成全網 config 抖動源。
-
-### 2. 短期 responder key 的預分發模型方向對了，但規模化後的控制面成本還沒有被承認
-
-#### 問題本身
-
-這一輪你們正式解決了 `NK` 的前提矛盾：
-
-- client 必須透過 OOB 預先拿到短期 responder static pubkey
+- `Offline Root CA`
+- `Online CPSK`
+- `Epoch Cert` 由 `CPSK` 簽發
 
 [design.md:42](/Users/leask/Documents/chameleon/design.md:42)
+[protocol.md:111](/Users/leask/Documents/chameleon/protocol.md:111)
 
-這個方向是對的，我接受。
+這是正確方向，我接受。
 
-但它立刻帶來了一個新的、更現實的問題：
+但當前規格仍然只定義了 `Epoch Cert`，沒有真正定義
+`CPSK Certificate` 自己是什麼東西。現在 verifier algorithm 只說：
 
-- 如果每個 edge node 都有自己的 24h 短期 static key，
-  client 到底要提前拿多少把 key？
-- 全量節點都預分發，config bundle 會爆炸
-- 只分發部分節點，路由靈活性會受限
-- key rotation 時，session pool 還在運作中的舊 session 如何與新 session 共存
+- client OOB 拿到 `CPSK` 憑證
+- 用 `Signer Key ID` 找對應 `CPSK`
 
-現在文檔只解釋了「邏輯上可行」，還沒解釋「大規模上如何運作」。
+[protocol.md:114](/Users/leask/Documents/chameleon/protocol.md:114)
 
-#### 會在哪裡出問題
+問題是，這還不是一個可互通的鏈。缺的內容至少包括：
 
-如果這一塊不補，你們會在三個地方踩雷：
+- `CPSK Certificate` 的 wire / bundle 格式
+- `CPSK` 有效期欄位
+- `Root` 對 `CPSK` 的簽名內容
+- `Signer Key ID` 的生成與唯一性規則
+- 多把 `CPSK` 同時有效時如何選擇
+- `CPSK` 輪換與 overlap window
 
-1. 配置體積
-   全球節點越多，client bundle 越大
-2. 滾動更新
-   edge key 一換，client config 必須同步
-3. 連線池一致性
-   pool 中舊 session 還在用舊 key，新的 warm session 可能已切到新 key
+#### 為什麼這會卡住實作
 
-這不是邊角問題。你們現在正式引入了 `Session Pool`，
-這會把 key rollout 的複雜度再放大一層。
+如果這些不定死，client 端實際上無法做出一致的 signer lookup：
+
+- 有的實作會把 `Signer Key ID` 當隨機整數
+- 有的會當公鑰 hash 截斷
+- 有的會只保留一把當前 `CPSK`
+- 有的會保留 current + next
+
+結果就是同一份 `Epoch Cert`，不同客戶端可能恢復策略都不一樣。
 
 #### 建議怎麼改
 
-不要把預分發物件定義成「一堆裸公鑰」，而要改成**節點 manifest**：
+最直接的做法是新增一個 OOB 物件定義，哪怕不放進 `protocol.md`，
+也至少應在設計層補出一個正式控制面規格骨架。建議定義：
 
-- `Node ID`
-- `Region / Route Group`
-- `Current Static Pubkey`
-- `Next Static Pubkey` 可選
-- `NotBefore / NotAfter`
-- `Priority / Weight`
-- `Manifest Version`
+`CPSK Certificate`
 - `Signer Key ID`
+- `Signer Public Key`
+- `NotBefore`
+- `NotAfter`
+- `Signature by Root`
 
-client 不必拿全量全球節點，而是拿：
+同時寫死：
 
-- 路由策略允許的節點子集
-- 當前 region 的 current + next key
-- 一個明確的 manifest version
+- `Signer Key ID` 是控制面分配的 64-bit 唯一值，還是公鑰 hash 的截斷值
+- 若使用截斷值，碰撞處理規則是什麼
+- client OOB bundle 至少必須同時攜帶 `current + next CPSK`
+- `Epoch Cert` 驗證時若 `Signer Key ID` 不存在於本地 bundle：
+  恢復策略必須是 `Config Refresh Required`
 
-同時定義兩條運營規則：
+如果你們想減少之後來回，我建議下一輪直接新增一份
+`control_plane_bundle.md` 或在 `design.md` 補一節 `OOB Trust Objects`。
 
-1. edge key rotation 必須有 overlap window
-2. client 必須允許 current / next key 在短時間內並存
-
-如果不這樣做，`Session Pool` 一旦存在，就會在 key rollover 期間把問題放大。
-
-### 3. Record header 仍然只有混淆，沒有被明確納入 AEAD 的完整性保護
+### 2. `Node Manifest` 被提出來了，但還沒有成為可執行的控制面契約
 
 #### 問題本身
 
-`protocol.md` 現在已經修掉了上一輪的常量 mask 錯誤：
+`design.md` 已經把裸公鑰預分發升級成 `Node Manifest`，這是對的：
 
-[protocol.md:142](/Users/leask/Documents/chameleon/protocol.md:142)
+[design.md:47](/Users/leask/Documents/chameleon/design.md:47)
 
-這是實質進步。
+但現在它還是概念詞，不是契約。缺少的關鍵點是：
 
-但現在還有一個更底層的問題：文檔從頭到尾都沒有明確寫出
-record encryption 的 `AAD` 是什麼。
+- manifest 的最小欄位集合
+- manifest 的簽名方式
+- manifest 的版本號與過期時間
+- region / route group 的語義
+- current / next key 的切換窗口
+- 若 manifest 與 `Epoch Cert` 對同一 `Node ID` 給出不一致 key，如何處理
 
-目前你們定義了：
+#### 為什麼這是核心問題
 
-- plaintext header: `Length || Flags`
-- header 會被 HP obfuscate
-- payload 會做 AEAD
+你們現在已經把 `Session Pool` 引進來了。只要 pool 存在，manifest 就不只是
+「客戶端拿到一把 key」這麼簡單，而是會直接影響：
 
-但沒有說：
+- 新 session 預熱
+- key rollover
+- route failover
+- 連線池內 session 的新舊世代並存
 
-- `Length || Flags` 是否作為 AEAD Associated Data 參與認證
-
-這意味著當前規格下，header 可能只是「被混淆」，而不是「被認證」。
-
-#### 為什麼重要
-
-如果 header 不進 AAD，至少會有這幾個問題：
-
-- `Flags` 中的 `Key Phase` 沒有被 ciphertext 完整性綁定
-- `Length` 被篡改時，接收方行為只能依賴 parser/AEAD fail 間接收斂
-- 不同實作可能對 header 篡改採取不同處置，互通性和恢復語義都會漂移
-
-這不是理論潔癖，是 record layer 定義還差最後一步。
+如果 manifest 沒有正式契約，pool manager 的行為一定漂移。
 
 #### 建議怎麼改
 
-直接把 record 加解密流程寫成算法，明確：
+把 `Node Manifest` 至少定義成以下欄位：
+
+- `Manifest Version`
+- `Node ID`
+- `Route Group`
+- `Current Static Pubkey`
+- `Current NotBefore`
+- `Current NotAfter`
+- `Next Static Pubkey` 可選
+- `Next NotBefore`
+- `Next NotAfter`
+- `Priority`
+- `Weight`
+- `Signer Key ID`
+- `Manifest Signature`
+
+同時寫三條硬規則：
+
+1. client 對同一 `Node ID` 只能接受單一 `Current` key
+2. `Next` key 只能在 overlap window 內使用於新建 session
+3. 若 `Epoch Cert` 公鑰不屬於 manifest 中的 `Current/Next` 任一值，
+   必須視為配置失配，不得默默接受
+
+### 3. Record layer 仍然缺最後一步：`Plain_Header` 沒有被明確納入 AEAD AAD
+
+#### 問題本身
+
+你們這一輪沒有修這個點，record layer 仍然只說：
+
+- header 被 HP 混淆
+- ciphertext 做 AEAD 解密
+
+[protocol.md:134](/Users/leask/Documents/chameleon/protocol.md:134)
+[protocol.md:153](/Users/leask/Documents/chameleon/protocol.md:153)
+
+但沒有明確說：
+
+- `Plain_Header = Length || Flags`
+- 是否作為 AEAD 的 `AAD`
+
+#### 為什麼這一點不能再拖
+
+如果 header 不進 AAD，你們現在的 record integrity 實際上是不完整的：
+
+- `Key Phase` 只被混淆，沒被正式認證
+- `Length` 的篡改處理只能依賴 parser 行為和 AEAD fail 的副作用
+- 不同實作會在 header 損壞時產生不同的錯誤分支
+
+這會直接破壞你們想要的「不同團隊盲寫也能互通」。
+
+#### 建議怎麼改
+
+直接把 record seal/open 流程寫成規範算法：
 
 發送方：
-
 1. 構造 `Plain_Header = Length || Flags`
-2. 以 `AAD = Plain_Header` 執行 AEAD seal，得到 `Ciphertext`
-3. 取 `Sample`，計算 `Mask`
-4. 產生 `Obfuscated_Header = Plain_Header XOR Mask`
+2. 以 `AAD = Plain_Header` 執行 AEAD seal
+3. 取 `Sample`
+4. 產生 `Mask`
+5. 輸出 `Obfuscated_Header = Plain_Header XOR Mask`
 
 接收方：
-
-1. 讀 3 bytes `Obfuscated_Header`
-2. peek 12 bytes `Sample`
-3. 反混淆得到 `Plain_Header`
-4. 驗證 `Length` / `Flags` 合法
+1. 讀 `Obfuscated_Header`
+2. peek `Sample`
+3. 反混淆得 `Plain_Header`
+4. 驗證 `Length/Flags`
 5. 讀完整 `Ciphertext`
 6. 以 `AAD = Plain_Header` 執行 AEAD open
 
-同時補三條硬規則：
+同時補這幾條硬規則：
 
-- `Length < 16` 或 `Length > 16384` -> 立即 `Abort Transport`
-- `Flags` 的保留位非 0 -> 協議違規
-- `Key Phase` 與本地方向 state machine 不一致 -> 明確進入 rekey 驗證路徑
+- `Length < 16` 或 `Length > 16384` -> `Abort Transport`
+- `Flags` 的保留位非 0 -> `GOAWAY 0x02` 或直接 `Abort Transport`
+  你們必須二選一，不要留白
+- `Key Phase` 非預期翻轉 -> 進入 rekey 驗證分支，失敗則完整性錯誤
 
-不把 header 納入 AAD，record layer 仍然不算真正閉環。
-
-### 4. `Session Pool` 是本輪最大的架構新增，但目前只是一個口號，不是一個可執行模型
+### 4. `Session Pool` 已經從口號變成方向，但仍然沒有足夠的最小契約
 
 #### 問題本身
 
-`design.md` 本輪最重要的新主張是：
-
-- 引入 `Multi-Session Connection Pooling`
-- 透過 5-10 條獨立 sessions，動態調度 channels
-- 「完美兼顧」安全與效能
-- 「完美解決」HOL 問題
+這一輪 `design.md` 已經比上一輪進步，至少不再說「完美解決 HOL」，
+而改成「顯著緩解」，並補了最小池化契約的輪廓：
 
 [design.md:27](/Users/leask/Documents/chameleon/design.md:27)
-[design.md:81](/Users/leask/Documents/chameleon/design.md:81)
+[design.md:28](/Users/leask/Documents/chameleon/design.md:28)
+[design.md:30](/Users/leask/Documents/chameleon/design.md:30)
 
-這裡有兩個層面的問題。
+這個修正我接受。
 
-第一，結論過度承諾。
+但現在的 pool contract 仍然太抽象，最少還缺：
 
-Session Pool 不是「完美解決 HOL」，而是：
+- `Min/Max Sessions` 是按 device class、route class，還是全局策略
+- `interactive` / `bulk` 的分類標準是誰決定
+- session health 的量化指標
+- replenishment 何時觸發
+- draining session 是否還允許接新 `OPEN_CHANNEL`
+- pool manager 遇到 `GOAWAY 0x00`、epoch expiring、Channel ID watermark
+  時的統一行為
 
-- 把單 session 內的 HOL 問題
-- 轉成跨 session 的調度問題
+#### 為什麼這一塊現在必須補細
 
-它能顯著減輕，但不能完美消除。
+因為你們已經把它提升到核心架構層面了。現在它不再是「可以之後由各實作自由發揮」
+的東西，而是直接決定：
 
-第二，規則完全不夠。
-
-目前文檔沒定義：
-
-- pool 的最小/最大 session 數
-- session 類型是否分級
-- open channel 時如何選 session
-- channel 是否允許中途 migration
-- session 何時補充、何時回收
-- session unhealthy 的判定標準
-- GOAWAY / maintenance / key rollover 如何與 pool manager 互動
-
-這代表目前的 `Session Pool` 還不是架構，只是方向。
-
-#### 為什麼這一塊現在必須補
-
-因為你們已經把它提到設計總綱了。如果它只是「實作建議」，
-就應該降級措辭；如果它是「核心架構」，就必須給最小行為契約。
-
-否則不同實作的 pool 行為會完全不一樣，最終：
-
-- 效能對比無法複現
-- 故障恢復不可預測
-- key rotation 與 session draining 會互相打架
+- 高延遲流量的實際表現
+- 長連線補池時的穩定性
+- key rollover 時會不會抖
 
 #### 建議怎麼改
 
-把 `Session Pool` 收斂成「最小可實作契約」，至少定義以下內容：
+我建議你們下一輪至少把以下內容寫成正式條款：
 
-1. session class
-   - `interactive`
-   - `bulk`
-   - `spare`
+`Session Class`
+- `interactive`
+- `bulk`
+- `spare`
 
-2. per-class pool bounds
-   - `min_sessions`
-   - `target_sessions`
-   - `max_sessions`
+`Placement`
+- 新 channel 一經分配不可遷移
+- `interactive` 預設不得落在已有 bulk 壓力的 session 上
 
-3. placement policy
-   - 新 channel 一經分配，**不可跨 session 遷移**
-   - interactive 流不得與 bulk 流預設共池
+`Health Signals`
+- `authorized`
+- `draining`
+- `available_session_credit`
+- `pending_open_count`
+- `recent_ping_rtt_ms`
+- `channel_id_headroom`
 
-4. health signal
-   至少用本地可觀測值，而不是幻想可拿到底層所有資訊：
-   - auth state
-   - available session credit
-   - pending open count
-   - recent ping RTT
-   - draining flag
+`Replenishment Triggers`
+- session 收到 `GOAWAY`
+- session 進入 `draining`
+- `channel_id_headroom` 低於門檻
+- session credit 長期不足
 
-5. replenishment policy
-   - session 進入 `Draining` 時何時補一條新 warm session
-   - session close 後何時重建
+`Admission Rule`
+- draining session 絕對不得接受新 `OPEN_CHANNEL`
 
-6. rollover policy
-   - key rotation / epoch expiring / maintenance 期間如何平滑替換 pool
+如果你們不想把這些寫進 `design.md`，那就至少新增一份
+`pooling.md`。否則「會話池化」仍然只是討論概念。
 
-如果你們不想把這些寫成正式架構，那就把現在的「完美解決 HOL」
-降級成「推薦實作策略」。否則這塊現在過度承諾。
-
-### 5. `Provisional Session` 已經接近可用，但還有兩個會造成實作分歧的細節沒釘死
+### 5. `Channel ID` exhaustion 現在只處理了 client 半邊，而且 watermark 寫法還不夠嚴謹
 
 #### 問題本身
 
-這一輪 `CLIENT_AUTH` 與 provisional state 的進展是明顯的：
+你們這一輪新增了：
 
-- 第一個 record 的第一個 frame 必須是 `CLIENT_AUTH`
-- 該 record 不允許攜帶除 `PAD` 外其他 frame
-- 超時與字節上限已經變成固定值
-- `Proof Length` 對 `Auth Scheme 0x01` 已固定為 64
+- `Channel ID` 單調遞增
+- 最大值 `2^30 - 1`
+- client 在 `2^30 - 100` 時主動 `GOAWAY`
 
-[protocol.md:164](/Users/leask/Documents/chameleon/protocol.md:164)
-[protocol.md:167](/Users/leask/Documents/chameleon/protocol.md:167)
+[protocol.md:189](/Users/leask/Documents/chameleon/protocol.md:189)
+[protocol.md:192](/Users/leask/Documents/chameleon/protocol.md:192)
+
+方向是對的，但現在還有三個缺口：
+
+1. 只寫了 client，沒寫 server
+2. `2^30 - 100` 沒說明是否考慮 parity
+3. 沒定義收到 exhaustion-triggered `GOAWAY` 後，
+   pool manager 與 peer 的具體行為
+
+#### 為什麼這會形成分歧
+
+如果 server 也允許發起 channel，那 exhaustion 就是雙向問題，
+不能只定義 client。
+
+另外，因為 ID 有奇偶分配，真正的本地方向可用 headroom
+應該按 parity 計，而不是簡單用整體最大值。
+
+#### 建議怎麼改
+
+把這條改成雙向規則：
+
+- 每個方向維護自己的 `next_local_channel_id`
+- 定義 `CHANNEL_ID_HIGH_WATERMARK`
+  為本地方向可用 ID 空間的門檻，而不是全局整數字面值
+
+建議寫成：
+
+- client 若 `next_local_channel_id > CLIENT_CHANNEL_ID_HIGH_WATERMARK`
+  -> 發 `GOAWAY 0x00`
+- server 若 `next_local_channel_id > SERVER_CHANNEL_ID_HIGH_WATERMARK`
+  -> 也同樣處理
+
+並補：
+
+- exhaustion 型 `GOAWAY` 收到後，對端不得再在該 session 建立新 channel
+- pool manager 必須立即補一條 warm replacement session
+
+### 6. `CLIENT_AUTH` 已經接近可互通，但還缺兩個會在擴展時重新炸開的邊角
+
+#### 問題本身
+
+`Auth Scheme 0x01` 現在已有：
+
+- `Credential ID`
+- `Proof Length = 64`
+- `Sign("chameleon-auth-v1" || h)`
+
 [protocol.md:172](/Users/leask/Documents/chameleon/protocol.md:172)
+[protocol.md:176](/Users/leask/Documents/chameleon/protocol.md:176)
 
-這意味著我上一輪對 provisional state 的大部分批評，現在都應降級。
+這一塊比之前強很多，我接受這個修正。
 
-但還剩兩個細節沒封死：
+但還缺兩條會在你們未來擴展 scheme 時立刻回來咬人的規則：
 
-1. `Max Inbound Bytes = 2048` 被寫成「包含底層協議頭」
-   [protocol.md:168](/Users/leask/Documents/chameleon/protocol.md:168)
-   這和你們的 transport-agnostic 目標衝突。
-   TCP、QUIC Stream、WebSocket 的「底層協議頭」根本不是同一個觀測面。
+1. 不支援的 `Auth Scheme` 怎麼處理，還是沒寫
+2. `Proof Length` 只對 `0x01` 固定，沒有全局上限
 
-2. 對未知 `Auth Scheme` 的處置沒有定義。
-   如果 client 發送保留值或未支援 scheme，server 應回：
-   - `GOAWAY 0x02 Protocol Violation`
-   - 還是 `GOAWAY 0x05 Auth Failed`
-   - 還是直接 `Abort Transport`
+#### 為什麼要現在補
 
-現在沒有寫。
+因為現在你們的 provisional state 已經是 hard-bounded 的。
+如果未來引入新的 scheme，但沒有全局 `Proof Length` 上限，
+那 provisional resource boundary 會再次被打開。
 
 #### 建議怎麼改
 
-對第一點：
+補兩條硬規則：
 
-- 把 provisional budget 改成**純 Chameleon 位元組數**
-- 若你們真的想控制更底層成本，應另在 transport binding 文檔定義，
-  不能寫進核心規格
+- `unsupported Auth Scheme` -> `GOAWAY 0x02 Protocol Violation`
+- `supported scheme but invalid credential/proof` -> `GOAWAY 0x05 Auth Failed`
 
-對第二點：
+再加一條全局限制：
 
-- 明確分流：
-  - `unsupported Auth Scheme` -> `GOAWAY 0x02`
-  - `supported scheme but invalid credential/proof` -> `GOAWAY 0x05`
+- 對所有 auth schemes，`Proof Length <= MAX_AUTH_PROOF_LEN`
+  例如 `1024`
 
-同時再加一條上限：
+如果未來某個 scheme 需要更大 proof，就明確升版本，而不是悄悄擴大 provisional 面。
 
-- `Proof Length` 對所有 scheme 必須有全局最大值，例如 `<= 1024`
-
-否則未來擴 scheme 時 provisional 邊界又會重新打開。
-
-### 6. `Auth Scheme 0x01` 已經有基本算法，但還缺最後兩個會影響互通與安全隔離的細節
+### 7. `Max Inbound Bytes` 仍然寫成「包含底層協議頭」，這和 transport-agnostic 目標衝突
 
 #### 問題本身
 
-你們現在已經定義：
+`protocol.md` 仍寫：
 
-- `Credential ID` 查找 client Ed25519 公鑰
-- `Proof` = 對 Noise transcript hash `h` 做 Ed25519 簽章
+- `Max Inbound Bytes = 2048 Bytes (包含底層協議頭)`
 
 [protocol.md:170](/Users/leask/Documents/chameleon/protocol.md:170)
-[protocol.md:173](/Users/leask/Documents/chameleon/protocol.md:173)
 
-這比前幾輪強很多。但還缺兩點：
+這條和你們自己強調的 language-agnostic / transport-agnostic 邏輯衝突。
 
-1. domain separation
-   現在簽的是 raw `h`
+TCP、QUIC Stream、WebSocket 的「底層協議頭」：
 
-2. credential database 的版本一致性
-   server 查找的公鑰來自哪個配置版本，沒有對應欄位
+- 不屬於同一層
+- 也不一定是應用層可見
 
-#### 為什麼這兩點要補
+#### 為什麼這會造成實作漂移
 
-第一，raw `h` 雖然大概率能工作，但不是好規格。
-更安全的做法是對簽名 message 做上下文域分離，避免未來被其他用途重用。
+不同實作會用不同觀測面去算這 2048：
 
-第二，`Credential ID -> Public Key` 的查找現在完全依賴 server 本地資料庫，
-但沒有定義：
+- 有的只算 Chameleon bytes
+- 有的算承載封裝後 bytes
+- 有的算 socket read bytes
 
-- 資料庫版本
-- 撤銷延遲
-- rotation overlap
-
-這會直接影響 auth fail 的恢復語義。
+最後 provisional close 行為一定不一致。
 
 #### 建議怎麼改
 
-把 `Auth Scheme 0x01` 的簽名輸入改成：
+把這條改成：
 
-`Sign( "chameleon-auth-v1" || h )`
+- `Max Inbound Chameleon Bytes`
 
-其中：
+只計：
 
-- context string 用 ASCII
-- 不含 null terminator
+- record header
+- ciphertext
+- decrypted frames
 
-同時在控制面模型裡增加：
+如果你們真的需要限制更底層成本，應寫在 transport binding 文檔裡，
+而不是核心規格。
 
-- `Credential DB Version`
-- `Revocation Epoch`
-
-不一定要把它放進 `CLIENT_AUTH` frame，
-但至少 recovery matrix 要承認 auth fail 可能來自配置版本漂移，而不只是憑證錯誤。
-
-### 7. `KEY_UPDATE` 還沒有真正收成完整 state machine
+### 8. `KEY_UPDATE` 還沒變成完整 state machine，長壽命 session 會在這裡漂
 
 #### 問題本身
 
-`protocol.md` 對 `KEY_UPDATE` 已定義：
+目前你們定義了：
 
+- 收到 `KEY_UPDATE`
 - 下一個 record 切 `Key Phase`
-- 用新的 traffic key / HP key
-- 連續兩次更新至少相隔 `1000 records` 或 `1 minute`
+- 用新的 traffic / HP keys
+- rekey 間隔至少 `1000 records` 或 `1 minute`
 
-[protocol.md:256](/Users/leask/Documents/chameleon/protocol.md:256)
+[protocol.md:261](/Users/leask/Documents/chameleon/protocol.md:261)
 
-這比之前完整，但 still 不夠：
+這仍然不夠，少的是：
 
-- 沒有明確每個方向都維護 `generation counter`
-- 沒有明確何時淘汰舊一代 key
-- 沒有明確如果收到 unexpected `Key Phase` 應怎麼辦
-- 沒有明確兩端幾乎同時 rekey 時，狀態如何獨立演進
+- 每個方向的 generation state
+- 舊 key 何時退休
+- unexpected `Key Phase` 的處置
+- simultaneous rekey 的獨立演進
+- 最大 key age / 最大 key bytes
 
-#### 為什麼這一塊值得現在補
+#### 為什麼這一塊變得更重要
 
-你們現在有 `Session Pool`，而且 session 會長時間保活。
-一旦 session 壽命拉長，rekey 不是稀有事件，而會變成日常路徑。
-
-現在不補，後面一定出現實作漂移。
+你們現在正式引入 `Session Pool`，而 pool 代表 session 會更長壽。
+一旦 session 壽命拉長，rekey 不再是小概率路徑，而是常態。
 
 #### 建議怎麼改
 
-為每個方向增加顯式狀態：
+下一輪至少補一個 state machine：
 
+每方向本地狀態：
 - `current_generation`
 - `next_generation_prepared`
 - `current_key_phase`
 
-並定義：
+規則：
+1. 收到 `KEY_UPDATE` frame 只準備 next keys，不立即切換
+2. 收到 `Key Phase` 翻轉 record 才提交 generation
+3. 若翻轉時無 prepared next keys -> 完整性錯誤
+4. 舊 generation 在新 generation 首個成功 decrypt 後立即退休
 
-1. 收到 `KEY_UPDATE` frame 後：
-   - 只準備 next keys
-   - 不立即切換 recv generation
+同時再補一條 rotation policy：
 
-2. 收到下一個 `Key Phase` 翻轉的 record：
-   - 驗證其必須與 prepared state 對應
-   - 成功後提交 generation
-   - 舊 generation 立即退休
+- 除最小 rekey 間隔外，還要有最大 key age 或最大 encrypted bytes 門檻
 
-3. 如果 `Key Phase` 翻轉但本地沒有 prepared next keys：
-   - 視為協議違規或完整性錯誤
-
-這一塊不需要新 frame，只需要把 state machine 寫完整。
-
-### 8. `Recovery Matrix` 已經比之前好多了，但還沒有細到足以支撐自動化恢復
+### 9. Recovery matrix 仍然太粗，還不夠支撐自動化恢復
 
 #### 問題本身
 
-本輪 recovery matrix 已正式存在：
+你們有了 recovery matrix，這是正向進展：
 
-[protocol.md:287](/Users/leask/Documents/chameleon/protocol.md:287)
+[protocol.md:292](/Users/leask/Documents/chameleon/protocol.md:292)
 
-這是對的，但現在仍然過粗。它還把不同根因混在一起：
+但它仍然過於一行一個方向，沒有細到能直接被實作成 client policy：
 
 - `Handshake AEAD / MAC Fail -> Retry Different Node`
 - `Unknown Frame Type -> Retry Same Node`
 - `Session Flow Control Overflow -> Retry Same Node`
 
-[protocol.md:291](/Users/leask/Documents/chameleon/protocol.md:291)
-[protocol.md:297](/Users/leask/Documents/chameleon/protocol.md:297)
-[protocol.md:298](/Users/leask/Documents/chameleon/protocol.md:298)
+[protocol.md:296](/Users/leask/Documents/chameleon/protocol.md:296)
+[protocol.md:302](/Users/leask/Documents/chameleon/protocol.md:302)
+[protocol.md:303](/Users/leask/Documents/chameleon/protocol.md:303)
 
-這些判斷都不穩：
+這些都還是過粗判斷。
 
-- handshake fail 可能是 stale config，不一定是節點問題
-- unknown frame 很可能是版本或 capability 漂移，重試同節點沒意義
-- session overflow 可能是 bug、策略衝突、或惡意對端，重試同節點可能重演
+#### 為什麼不夠
+
+因為不同錯誤根因其實會共享同一表象：
+
+- stale config
+- signer rotation
+- node rollover
+- capability mismatch
+- protocol bug
+
+如果 recovery matrix 不細分，client 最終還是只能靠 heuristics 臨場發揮。
 
 #### 建議怎麼改
 
-把 recovery matrix 拆成更細：
+把矩陣拆成多欄：
 
 - `Server Action`
 - `Client Immediate Action`
@@ -497,9 +472,10 @@ Session Pool 不是「完美解決 HOL」，而是：
 - `Config Refresh Required?`
 - `Backoff Required?`
 
-同時新增缺失的錯誤條目：
+並新增至少這些缺失條目：
 
 - `Epoch Cert Signature Fail`
+- `Epoch Cert Signer Key Unknown`
 - `Epoch Cert Pubkey Mismatch`
 - `Epoch Cert NotYetValid`
 - `Epoch Cert Expired`
@@ -508,151 +484,100 @@ Session Pool 不是「完美解決 HOL」，而是：
 - `Provisional Byte Overflow`
 - `Channel ID Exhaustion`
 
-沒有這些條目，你們的恢復邏輯還是太靠實作者臨場發揮。
+## 2. 對本輪設計修改的回應
 
-### 9. `Channel ID` 規則變嚴格是對的，但你們還沒有定義 exhaustion 策略
+### 1. 兩級 PKI
 
-#### 問題本身
+我接受這個修正方向。
 
-你們現在新增了：
+這一輪最大的正向變化，就是你們終於把離線 Root 和線上短期簽發的矛盾正面收掉了。
+現在剩的不是方向錯，而是鏈條物件還不夠細。
 
-- client odd / server even
-- 嚴格單調遞增
-- 最大 `Channel ID = 2^30 - 1`
+### 2. `Node Manifest`
 
-[protocol.md:185](/Users/leask/Documents/chameleon/protocol.md:185)
-[protocol.md:187](/Users/leask/Documents/chameleon/protocol.md:187)
+我接受這個修正方向。
 
-這是好事，因為 channel lifecycle 終於開始像真正的協議。
+把預分發物件從「裸公鑰」升級成 manifest，是正確的規模化思路。
+現在只差把 manifest 從概念名詞補成正式控制面契約。
 
-但現在反而冒出一個新的問題：
+### 3. `Session Pool`
 
-- session 長時間存在時，channel id 會耗盡
-- 尤其你們本輪正式引入 `Session Pool`
-- pool 的 warm sessions 很可能比前幾輪活得更久
-
-現在文檔沒有說：
-
-- 逼近上限時怎麼辦
-- 是否要提前 `GOAWAY`
-- high watermark 是多少
-
-#### 建議怎麼改
-
-新增一條 session-level 規則：
-
-- 當本地方向下一個可分配 `Channel ID` 超過 `CHANNEL_ID_HIGH_WATERMARK`
-  時，實作必須主動對該 session 發送 `GOAWAY 0x00` 並進入 draining，
-  由 pool manager 補一條新 session
-
-這個 high watermark 可以不是最大值本身，例如保留一個安全餘量。
-
-如果不補，long-lived pool session 最後一定踩到這個坑。
-
-## 2. 對本輪反駁的回應
-
-### 1. 「握手不需要明文 envelope」
-
-我接受，這一條已經不是主問題。
-
-前提仍然是：
-
-- 首包與回包在該版本內固定長度
-- version / caps 不得改變握手長度
-
-### 2. 「Fallback 應降級為部署策略」
-
-我接受，這一條已收斂。
-
-### 3. 「用 Session Pool 解掉單一流 HOL」
-
-我只接受一半。
-
-接受的部分：
-
-- 把 HOL 從單 session 問題轉成多 session 調度問題，方向是對的
-
-不接受的部分：
-
-- `design.md` 現在把它寫成了「完美解決 HOL」
+我接受你們把「完美解決 HOL」收斂成「顯著緩解」。
 
 [design.md:27](/Users/leask/Documents/chameleon/design.md:27)
-[design.md:81](/Users/leask/Documents/chameleon/design.md:81)
 
-這是過度承諾。它最多是「顯著緩解」，不是「完美解決」。
+這比上一輪更誠實。但你們現在還沒有最小可實作契約，所以它仍然不能算完成。
 
-### 4. 「Bucketing 不寫死在核心協議」
+### 4. `Auth Scheme 0x01` 的 domain separation
 
-這一條我現在接受，而且不再列為阻塞級問題。
+我接受，這一條已經明顯改善：
 
-原因很簡單：你們已經把調度優先級和 session-level egress budget 寫進去了，
-這比前幾輪實質得多。
+[protocol.md:175](/Users/leask/Documents/chameleon/protocol.md:175)
 
-[protocol.md:230](/Users/leask/Documents/chameleon/protocol.md:230)
-[protocol.md:233](/Users/leask/Documents/chameleon/protocol.md:233)
+這意味著我上一輪對 raw transcript hash 直接簽名的質疑，現在可以正式降級。
 
 ## 3. 已被合理解決或明顯改善的問題
 
-這一輪以下幾個舊問題可以正式降級：
+以下幾個舊點這一輪可以正式降級：
 
-- `NK` 的前置公鑰前提已被 `design.md` 明確承認
-  [design.md:42](/Users/leask/Documents/chameleon/design.md:42)
-- `Epoch Cert Verification` 已經開始成形
-  [protocol.md:109](/Users/leask/Documents/chameleon/protocol.md:109)
-- `CLIENT_AUTH` 不再是黑盒 token
-  [protocol.md:170](/Users/leask/Documents/chameleon/protocol.md:170)
-- provisional state 已有固定 timeout / byte bound
-  [protocol.md:167](/Users/leask/Documents/chameleon/protocol.md:167)
-- `OPEN_CHANNEL` 的自定界問題已解決
-  [protocol.md:179](/Users/leask/Documents/chameleon/protocol.md:179)
-- nonce byte layout 已明確
-  [protocol.md:128](/Users/leask/Documents/chameleon/protocol.md:128)
+- 兩級 PKI 已正式進設計與規格
+  [design.md:44](/Users/leask/Documents/chameleon/design.md:44)
+  [protocol.md:114](/Users/leask/Documents/chameleon/protocol.md:114)
+- `Epoch Cert` 已加入 `Signer Key ID`
+  [protocol.md:85](/Users/leask/Documents/chameleon/protocol.md:85)
+- `Auth Scheme 0x01` 已有 domain separation
+  [protocol.md:175](/Users/leask/Documents/chameleon/protocol.md:175)
+- `Channel ID` exhaustion 已開始進入協議語義
+  [protocol.md:192](/Users/leask/Documents/chameleon/protocol.md:192)
+- `Session Pool` 已從口號下降到架構方向
+  [design.md:27](/Users/leask/Documents/chameleon/design.md:27)
 
-這些進展都是真實的，不應再重複當作主 finding。
+這些都是真實進展，不應再重複列為主阻塞點。
 
-## 4. 下一輪我建議你們直接改的清單
+## 4. 下一輪我建議直接落的修改
 
-為了減少來回溝通，下一輪我建議不要再做抽象討論，直接落以下修改：
+為了繼續快迭代，我建議下一輪不要再泛泛討論，直接修改這些地方：
 
-1. 改控制面信任鏈
-   - 引入 `CPSK Certificate`
-   - `Epoch Cert` 改由 `CPSK` 簽發
-   - 補 `Signer Key ID`
+1. 補 `CPSK Certificate` / `Node Manifest` 契約
+   - 至少把 OOB trust objects 定義清楚
+   - 補 `Signer Key ID` 規則
+   - 補 overlap / rotation 行為
 
 2. 補 record AAD
    - 明確 `AAD = Plain_Header`
-   - 補 `Length/Flags` 非法值處置
+   - 補 `Length/Flags/KeyPhase` 非法處置
 
 3. 收斂 `Session Pool`
-   - 把「完美解決 HOL」改成「顯著緩解」
-   - 加最小 pool contract：class / bounds / placement / health / replenishment
+   - 補 `Session Class`
+   - 補 health signals
+   - 補 replenishment triggers
+   - 補 draining admission rule
 
-4. 補 auth 細節
-   - `unsupported Auth Scheme` 處置
-   - provisional bytes 不再計算底層頭
+4. 收緊 auth / provisional
+   - `unsupported Auth Scheme` 的處置
    - `Proof Length` 全局上限
-   - `Auth Scheme 0x01` 改用 domain-separated message
+   - `Max Inbound Bytes` 改成純 Chameleon bytes
 
-5. 重寫 recovery matrix
-   - 新增 `Epoch Cert` 類錯誤
-   - 新增 `Provisional` 類錯誤
-   - 拆成更細的恢復欄位
+5. 補長連線狀態
+   - `KEY_UPDATE` state machine
+   - `Channel ID` exhaustion 對 server 方向的對稱規則
 
-6. 補 long-lived session 規則
-   - `Channel ID` high watermark
-   - exhaustion 時的 `GOAWAY + drain + pool replenish`
+6. 重寫 recovery matrix
+   - 增加 `Epoch Cert` 類錯誤
+   - 增加 `Provisional` 類錯誤
+   - 拆成可直接驅動 client policy 的多欄矩陣
 
 ## 5. 總結
 
-這一輪最重要的變化是：
-協議已經不是「顯然沒法實作」的狀態了。你們已經把很多前幾輪的大洞補上了。
+這一輪的最大變化是：你們已經開始真正處理「規模化與長連線」問題，
+而不是只補協議最表層的 parser 級錯誤。
 
-但現在卡住它的，已經不是大而空的設計哲學，而是幾個更尖銳的工程閉環：
+現在卡住落地的，不再是大而空的哲學問題，而是幾個更尖銳的工程閉環：
 
-- 離線 Root 與線上短期簽發沒有真正連起來
+- 兩級 PKI 的 OOB 物件還沒正式定義
 - record header 還沒有被明確納入 AEAD 完整性
-- `Session Pool` 被提出來了，但還沒有最小可執行契約
-- auth / recovery / long-lived session 的少量硬規則仍然缺失
+- `Session Pool` 還缺最小可實作契約
+- auth / provisional / rekey / recovery 還缺少少量但關鍵的硬規則
 
-你們如果把這幾條在下一輪補死，之後 review 的重心就能真正下沉到
-更細的相容性、效能與長期維運問題，而不是一直卡在核心閉環上。
+你們如果下一輪把這幾條補死，之後 review 就能進一步下沉到
+真正的性能模型、互通測試向量與運維邊界，而不會再卡在核心協議閉環上。
