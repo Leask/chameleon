@@ -36,7 +36,8 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 採用**固定長度無前綴 (Fixed-Length, Prefix-Free)** 密文設計。
 
 ### 3.1 握手請求 (Client -> Server)
-發送 Noise `NK` 第一條訊息 (`-> e, d, es`)。
+採用 Noise `NK` 模式（單向信任：Client 預先擁有 Server Static Pubkey）。
+**Noise Transcript (Initiator -> Responder)**: `-> e, es`
 
 **1. 構造明文 Payload (64 Bytes 固定長度):**
 ```text
@@ -44,20 +45,20 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 | Version (1 byte)  | Caps (4 bytes)    | Padding (59 bytes, 填 0x00)       |
 +-------------------+-------------------+-----------------------------------+
 ```
-* `Version`: `0x01`。
-* `Caps` (Capabilities): 位元遮罩。
-  * `Bit 0`: 支援 Datagram Channel。
-  * `Bit 1-31`: 保留，必須設為 0。未知 Bit 必須被忽略。
+* `Version`: 必須為 `0x01`。
+* `Caps`: 能力位元遮罩，目前保留為 `0x00000000` (將 Datagram 等未來擴充標記為 Reserved)。
 
 **2. 密文傳輸 (112 Bytes 固定長度):**
-* `e` (Ephemeral Pubkey): 32 Bytes
-* `payload` (Ciphertext): 64 Bytes + 16 Bytes MAC = 80 Bytes
-**總長度**: 112 Bytes。
+Noise `NK` 第一條訊息的序列化：
+* `e` (Ephemeral Pubkey, 明文發送): 32 Bytes
+* `es` (執行 DH，產出金鑰，無輸出 bytes)
+* `payload` (使用產生的金鑰進行 AEAD 加密): 64 Bytes + 16 Bytes MAC = 80 Bytes
+**總長度**: `32 + 80 = 112 Bytes`。
 
-**伺服器行為**: 盲讀 112 Bytes。如果 AEAD 解密失敗，**必須保持絕對靜默 (Silent Drop)**，不返回任何 Chameleon 錯誤幀。伺服器可選擇切斷底層連線或將 Socket 轉交 (Fallback)。
+**伺服器行為**: 盲讀 112 Bytes。如果 AEAD 解密失敗，**必須保持絕對靜默 (Silent Drop)**。這表示伺服器可選擇直接中斷底層連線（如 TCP RST），或將流靜默轉交給本機服務（Fallback），但**絕對不可 (MUST NOT)** 返回任何 Chameleon 錯誤幀。
 
 ### 3.2 握手回應 (Server -> Client)
-發送 Noise `NK` 第二條訊息 (`<- e, ee`)。
+**Noise Transcript (Responder -> Initiator)**: `<- e, ee`
 
 **1. 紀元憑證 (Epoch Cert) 結構 (112 Bytes):**
 ```text
@@ -75,12 +76,13 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 | Version (1 byte)  | Selected Caps (4) | Epoch Cert (112 b)| Pad (11 bytes)|
 +-------------------+-------------------+-------------------+---------------+
 ```
-* `Selected Caps`: 伺服器同意啟用的能力交集。
 
 **3. 密文傳輸 (176 Bytes 固定長度):**
-* `e` (Ephemeral Pubkey): 32 Bytes
-* `payload` (Ciphertext): 128 Bytes + 16 Bytes MAC = 144 Bytes
-**總長度**: 176 Bytes。
+Noise `NK` 第二條訊息的序列化：
+* `e` (Ephemeral Pubkey, 參與後續加密): 32 Bytes
+* `ee` (執行 DH)
+* `payload` (使用更新後的金鑰進行 AEAD 加密): 128 Bytes + 16 Bytes MAC = 144 Bytes
+**總長度**: `32 + 144 = 176 Bytes`。
 
 ---
 
@@ -101,7 +103,8 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 +--------------------------------------------------+
 ```
 * `Flags` (1 byte): `[Key Phase (1 bit)] [Reserved (7 bits, 須為 0)]`。
-* `Mask = ChaCha20(HP_Key, Ciphertext_Sample[0..15])[0..2]`。
+* `Sample` 的獲取：取 `Ciphertext` 的前 16 Bytes。如果 `Ciphertext` 總長度小於 16 Bytes，則在末尾補 `0x00` 直到湊齊 16 Bytes（僅用於取樣，不改變實際傳輸資料）。
+* `Mask = ChaCha20(HP_Key, Sample)[0..2]` (以 0 為 Nonce 與 Counter)。
 * `Obfuscated_Header = (Length || Flags) XOR Mask`。
 
 ---
@@ -117,7 +120,7 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 +---------+--------------+---------+-----------------+--------+------------+-------+
 ```
 * `Channel ID`: 發起方保證全域唯一（Client奇數，Server偶數）。
-* `Kind`: `0x01` (TCP Stream), `0x02` (UDP Datagram)。
+* `Kind`: 必須為 `0x01` (TCP Stream)。`0x02` 等其他類型保留。
 * `Init Window`: 允許對端發送的初始位元組數 (Channel-level Flow Control)。
 
 #### `0x02` OPEN_ACK (確認通道開啟)
@@ -126,7 +129,7 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 | Type(1)  | Channel ID (4)  | Init Window (4)   |
 +----------+-----------------+-------------------+
 ```
-接收方確認資源已分配，發起方收到此幀後才可發送 `DATA`。
+接收方確認資源已分配，發起方收到此幀後才可發送 `DATA`。若接收方拒絕開啟通道，則直接回覆 `RESET_CHANNEL` 幀作為負向回應。
 
 #### `0x03` DATA (通道數據)
 ```text
@@ -143,15 +146,17 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 ```
 單向 EOF。雙方均發送 `FIN` 後，通道生命週期結束。
 
-#### `0x05` RESET_CHANNEL (強制重置通道)
+#### `0x05` RESET_CHANNEL (強制重置通道/拒絕開啟)
 ```text
 +----------+-----------------+-------------------+
 | Type(1)  | Channel ID (4)  | Error Code (4)    |
 +----------+-----------------+-------------------+
 ```
-立即廢棄該 Channel 的所有未讀資料與狀態。不會影響 Session 內的其他 Channel。
+立即廢棄該 Channel 的所有未讀資料與狀態。不會影響 Session 內的其他 Channel。可用於拒絕 `OPEN_CHANNEL` 請求。
 
 ### 5.2 流量控制 Frames (Flow Control)
+
+**初始條件 (Initial Constraints)**: 握手完成後，預設的 Channel Initial Window 為 0，預設的 **Session Initial Window 為 10MB**（雙向獨立）。`DATA` 幀的發送會同時消耗 Channel Credit 與 Session Credit，任意一個 Credit 不足時，發送方必須阻塞。`PAD` 與所有控制幀（如 `PING`, `WINDOW_UPDATE`）**不消耗**任何 Credit。
 
 #### `0x06` CHANNEL_WINDOW_UPDATE
 ```text
@@ -176,17 +181,11 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 
 #### `0x12` KEY_UPDATE (金鑰輪換狀態機)
 `[Type(1)]` (無 Payload)。
-* **發送方行為**: 發送 `KEY_UPDATE` 幀，從**下一個 Record 開始**，發送方將 `Key Phase` 位元翻轉，並使用 `Next_Traffic_Key` 加密。
-* **KDF**: `Next_Traffic_Key = HKDF-Expand(Current_Traffic_Key, "rekey", 32)`。
-* **接收方行為**: 收到 `KEY_UPDATE` 後，計算出 `Next_Traffic_Key`。當收到下一個 Record 發現 `Key Phase` 翻轉時，使用新金鑰解密。接收方也應盡快發送自己的 `KEY_UPDATE` 以完成雙向輪換。
-
-#### `0x13` GOAWAY (會話級致命錯誤)
-`[Type(1)] [Error Code (4 bytes)]`。
-通知對端會話即將關閉。不再接受新的 `OPEN_CHANNEL`，現有通道允許排空 (Draining)。
-
-#### `0xFF` PAD (流量特徵填充)
-`[Type(1)] [Pad Length (2 bytes)] [Padding Bytes...]`
-傳輸策略 (Transport Policy) 可插入此幀以湊齊特定的 Record 大小。接收方**必須安全忽略**。
+* **發送方行為**: 發送 `KEY_UPDATE` 幀，從**下一個 Record 開始**，發送方將 `Key Phase` 位元翻轉，並使用新一輪的金鑰套件加密與混淆頭部。
+* **KDF (Key Derivation Function)**: 一旦觸發輪換，同時更新 Traffic Key 與 Header Protection (HP) Key：
+  * `Next_Traffic_Key = HKDF-Expand(Current_Traffic_Key, "traffic_rekey", 32)`
+  * `Next_HP_Key = HKDF-Expand(Current_HP_Key, "hp_rekey", 32)`
+* **接收方行為**: 收到 `KEY_UPDATE` 後，計算出兩把新金鑰。當收到下一個 Record 發現 `Key Phase` 翻轉時，使用新金鑰解除頭部混淆與解密。接收方也應盡快發送自己的 `KEY_UPDATE` 以完成雙向輪換。為避免歧義，連續兩次 `KEY_UPDATE` 之間必須相隔至少 1000 個 Records 或 1 分鐘。
 
 ---
 
