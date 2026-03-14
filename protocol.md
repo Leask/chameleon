@@ -68,7 +68,9 @@ Chameleon 不直接使用 `cs1/cs2` 進行加密，而是將其作為 PRK (Pseud
 +-------------------+-------------------+-----------------------------------+
 ```
 * `Version`: 必須為 `0x01`。
-* `Caps`: 能力位元遮罩，目前保留為 `0x00000000` (將 Datagram 等未來擴充標記為 Reserved)。
+* `Caps`: 能力位元遮罩。
+  * `Bit 0`: 支援 Datagram Channel (保留)。
+  * `Bit 1-31`: 必須填 `0`。未知 Bit 必須被忽略。
 
 **2. 密文傳輸 (112 Bytes 固定長度):**
 Noise `NK` 第一條訊息的序列化：
@@ -77,7 +79,7 @@ Noise `NK` 第一條訊息的序列化：
 * `payload` (使用產生的金鑰進行 AEAD 加密): 64 Bytes + 16 Bytes MAC = 80 Bytes
 **總長度**: `32 + 80 = 112 Bytes`。
 
-**伺服器行為**: 盲讀 112 Bytes。如果 AEAD 解密失敗，**必須保持絕對靜默 (Silent Drop)**。這表示伺服器可選擇直接中斷底層連線（如 TCP RST），或將流靜默轉交給本機服務（Fallback），但**絕對不可 (MUST NOT)** 返回任何 Chameleon 錯誤幀。
+**伺服器行為**: 盲讀 112 Bytes。如果 AEAD 解密失敗，或 `Version` 欄位不為 `0x01` (版本不匹配)，**必須保持絕對靜默 (Silent Drop)**。這表示伺服器可選擇直接中斷底層連線（如 TCP RST），或將流靜默轉交給本機服務（Fallback），但**絕對不可 (MUST NOT)** 返回任何 Chameleon 錯誤幀。
 
 ### 3.2 握手回應 (Server -> Client)
 **Noise Transcript (Responder -> Initiator)**: `<- e, ee`
@@ -100,6 +102,7 @@ Noise `NK` 第一條訊息的序列化：
 | Version (1 byte)  | Selected Caps (4) | Epoch Cert (120 b)| Pad (3 bytes) |
 +-------------------+-------------------+-------------------+---------------+
 ```
+* `Selected Caps`: 伺服器同意啟用的能力。**伺服器行為 (MUST)**: 此值必須是客戶端請求的 `Caps` 的子集 (Subset)。伺服器不得開啟客戶端未請求的能力。**客戶端行為**: 收到後對比，若關鍵能力未被滿足，客戶端可主動 `Abort Transport`。
 
 **3. 密文傳輸 (176 Bytes 固定長度):**
 Noise `NK` 第二條訊息的序列化：
@@ -189,7 +192,7 @@ Noise `NK` 第二條訊息的序列化：
 * `Channel ID`: 發起方保證全域唯一，最大允許值為 `2^30 - 1`。
   * **分配規則 (MUST)**: 客戶端發起的 ID 必須是**奇數** (1, 3, 5...)，伺服器發起的 ID 必須是**偶數** (2, 4, 6...)。
   * **單調遞增 (Monotonicity)**: 雙方發起的新 `Channel ID` 必須嚴格單調遞增。若接收方收到一個小於或等於已見過最高 ID 的 `OPEN_CHANNEL`，必須視為協議違規，立即發送 `GOAWAY (Code: 0x02)` 並中斷連線。
-  * **ID 耗盡防護 (Exhaustion Watermark)**: 當客戶端下一個可分配的 `Channel ID` 超過 `2^30 - 100` 時，客戶端必須主動發送 `GOAWAY (Code: 0x00)` 並進入 Draining 狀態，並通知 Session Pool Manager 建立新的替代 Session。
+  * **ID 耗盡防護 (Exhaustion Watermark)**: 當客戶端下一個可分配的 `Channel ID` 超過 `2^30 - 100` 時，客戶端必須主動發送 `GOAWAY (Code: 0x00)` 並進入 Draining 狀態。若伺服器方向的 `Channel ID` 逼近上限，伺服器也必須發送 `GOAWAY (Code: 0x00)`，交由 Session Pool Manager 建立新的替代 Session。
 * `Kind`: 必須為 `0x01` (TCP Stream)。`0x02` (UDP Datagram) 暫為保留能力。
 * `Init Window`: 允許對端發送的初始位元組數 (Channel-level Flow Control)。
 * `ATYP` (SOCKS5 衍生標準):
@@ -260,11 +263,26 @@ Noise `NK` 第二條訊息的序列化：
 
 #### `0x12` KEY_UPDATE (金鑰輪換狀態機)
 `[Type(1)]` (無 Payload)。
-* **發送方行為**: 發送 `KEY_UPDATE` 幀，從**下一個 Record 開始**，發送方將 `Key Phase` 位元翻轉，並使用新一輪的金鑰套件加密與混淆頭部。
-* **KDF (Key Derivation Function)**: 一旦觸發輪換，同時更新 Traffic Key 與 Header Protection (HP) Key：
-  * `Next_Traffic_Key = HKDF-Expand(Current_Traffic_Key, "traffic_rekey", 32)`
-  * `Next_HP_Key = HKDF-Expand(Current_HP_Key, "hp_rekey", 32)`
-* **接收方行為**: 收到 `KEY_UPDATE` 後，計算出兩把新金鑰。當收到下一個 Record 發現 `Key Phase` 翻轉時，使用新金鑰解除頭部混淆與解密。接收方也應盡快發送自己的 `KEY_UPDATE` 以完成雙向輪換。為避免歧義，連續兩次 `KEY_UPDATE` 之間必須相隔至少 1000 個 Records 或 1 分鐘。
+
+**狀態機定義 (Key Rotation State Machine)**:
+每個方向 (Tx/Rx) 獨立維護以下狀態：`current_generation` (整數), `next_generation_prepared` (布林), `current_key_phase` (0 或 1)。
+
+1. **發送方 (Sender)**:
+   * 發送 `KEY_UPDATE` 幀。此時**僅標記準備就緒**，不會立即切換發送金鑰。
+   * 從**下一個 Record 開始**，發送方將 `current_key_phase` 位元翻轉，並將 `current_generation` 加 1。
+   * 新的發送 Record 必須使用新一代的金鑰套件 (`Next_Traffic_Key`, `Next_HP_Key`) 進行加密與混淆。
+2. **KDF (Key Derivation Function)**: 
+   每次 generation 推進時，同時更新 Traffic Key 與 Header Protection (HP) Key：
+   * `Next_Traffic_Key = HKDF-Expand(Current_Traffic_Key, "traffic_rekey", 32)`
+   * `Next_HP_Key = HKDF-Expand(Current_HP_Key, "hp_rekey", 32)`
+3. **接收方 (Receiver)**:
+   * 收到 `KEY_UPDATE` 幀後，將 `next_generation_prepared` 設為 True，並預先計算出下一代的兩把新金鑰，但**不切換**當前的解密狀態。
+   * 接收方持續讀取下一個 Record。當解析頭部時發現 `Key Phase` 位元發生翻轉：
+     * **驗證**: 若 `Key Phase` 翻轉但 `next_generation_prepared` 為 False，視為協議違規 (`Abort Transport`)。
+     * **提交 (Commit)**: 使用準備好的新一代金鑰 (`Next_HP_Key`, `Next_Traffic_Key`) 進行反混淆與解密。
+     * 若解密成功，將 `current_generation` 加 1，`current_key_phase` 翻轉，並將舊 generation 的金鑰徹底銷毀。
+   * 接收方完成切換後，也應盡快發送自己的 `KEY_UPDATE` 幀以完成雙向輪換。
+* **安全約束**: 為避免歧義，連續兩次 `KEY_UPDATE` 的發送之間必須相隔至少 1000 個 Records 或 1 分鐘，接收方若在冷卻期內收到連續的 `KEY_UPDATE`，必須 `GOAWAY 0x02`。
 
 #### `0x13` GOAWAY (會話級致命錯誤)
 ```text
