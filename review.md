@@ -1,381 +1,399 @@
 # Chameleon 設計與協議聯合審查報告
-*(針對當前 `design.md` 與 `protocol.md` 的聯合 review)*
+*(針對當前 `design.md` 與 `protocol.md` 的新一輪 review)*
 
 ## 0. 審查定位
 
-這次 review 不再只看單一文檔，而是把：
+本輪 review 仍然只看核心協議的可行性，不討論語言、UI 或實作框架。
 
-- `design.md` 視為設計目標、設計哲學與高階協議邊界
-- `protocol.md` 視為真正約束實作者的 wire-level 規格
+本次審查的標準是：
 
-因此本次審查的判準不是「想法是否漂亮」，而是：
-
-- 兩份文檔是否自洽
-- 不同團隊是否能依此互通
-- 協議在可靠性上是否站得住
-- 協議在效率上是否不自我抵消
-- 錯誤處理與演進空間是否被正確規格化
-
-我們延續目前已形成的共識：
-
-- 協議必須語言無關
-- 協議必須有嚴格的 wire format
-- session 與 channel 必須分離
-- 控制面假設必須明確寫出，不得暗藏前提
-- 性能應該以 goodput、延遲、恢復與可預測性為核心
+- `design.md` 的高階設計是否與 `protocol.md` 的具體規格一致
+- 兩個獨立團隊是否能按文檔實作並互通
+- 協議在可靠性、效率與狀態機一致性上是否站得住
+- 文檔是否真的從「概念」收斂到「規格」
 
 ## 1. 總體判斷
 
-這一版最大的進步，是 `design.md` 已經不再停留在口號，而
-`protocol.md` 也開始承擔真正的二進位規格責任。
+這一輪最大的問題不是缺新內容，而是**文檔一致性發生了明顯回退**。
 
-但目前兩份文檔一起看，仍然**不能算是可實作、可互通、可長期演進
-的完整協議規格**。
+你們在 `design.md` 前言裡宣稱已經修正了幾個重要問題：
 
-原因不是缺少更多功能，而是有幾個核心位置仍然同時存在：
+- 握手模式從 `IK` 修正為單向預知 server key 的模式
+- `Epoch Cert` 不再承擔時鐘校準
+- 補齊 `OPEN_ACK`、`FIN`、`RESET`
+- 區分 channel 級與 session 級 flow control
+- 補完 rekey 與 capability negotiation
 
-- 設計層過度自信
-- 規格層過度簡化
-- 設計與規格之間存在明顯不一致
+但當前正文與 `protocol.md` 並沒有把這些修正落實下去。
 
-最嚴重的問題集中在五個地方：
+因此，我對本輪版本的結論是：
 
-1. 握手前提與 Noise pattern 不匹配
-2. fallback / 靜默語義在不同承載上根本不成立
-3. record layer 仍然不夠完整
-4. channel model 還不能承載真實代理語義
-5. rekey / 版本演進 / 能力協商尚未真正閉環
+**它不是在穩定收斂，而是在「設計層往前走、規格層留在原地、部分段落
+又回退到舊版本」的混合狀態。**
 
-## 2. 高優先級問題
+這比單純缺細節更危險，因為它會直接導致不同實作者按照不同段落實作，
+最後彼此不兼容。
 
-### 2.1 `Noise IK` 的前提被寫錯了，這不是小問題
+## 2. 最高優先級問題
 
-`design.md` 與 `protocol.md` 都把核心握手定為 `Noise_IK`，並把主要
-前提描述為「客戶端預先知道伺服器靜態公鑰」。
+### 2.1 握手模式已經自相矛盾，這是阻塞級問題
 
-這不夠。
+`design.md` 在演進摘要裡說已修正為「客戶端單向預知伺服器靜態公鑰」
+的模式，不再使用雙向前提的 `IK`。[design.md:19](/Users/leask/Documents/chameleon/design.md:19)
 
-攻擊：
+但 `design.md` 的握手正文仍然明確寫的是
+`Noise_IK_25519_ChaChaPoly_BLAKE2s`，並且還列出 `IK` 的訊息長度。
+[design.md:41](/Users/leask/Documents/chameleon/design.md:41)
 
-- `IK` 不是只要求 initiator 知道 responder static
-- 它還要求 responder 也事先知道 initiator static
-- 兩份文檔都沒有定義 client static key 如何預註冊、如何輪換、
-  如何撤銷、如何與設備身份綁定
-- 這意味著目前文檔對握手模式的前提描述與實際 Noise pattern
-  不一致
+`protocol.md` 更嚴重：
 
-這不是術語瑕疵，而是會直接影響：
+- 在密碼學原語段落仍寫 `Handshake Pattern: Noise IK`
+  [protocol.md:27](/Users/leask/Documents/chameleon/protocol.md:27)
+- 但在握手正文又改成 `Noise NK`
+  [protocol.md:40](/Users/leask/Documents/chameleon/protocol.md:40)
 
-- 是否能建立連線
-- 是否支援未預註冊設備
-- 控制面如何發放身份
+這不是措辭問題，而是**協議根本前提不一致**。
 
-修正建議：
+實際影響：
 
-- 要嘛把 `IK` 的雙向靜態前提完整寫清楚
-- 要嘛選擇真正符合你們信任分發模型的握手模式
-- 在 `design.md` 裡不要再把「只需 OOB 分發 server key」描述成 `IK`
-  的完整前提
-
-### 2.2 `固定長度握手 + 失敗後轉交 fallback` 在多種承載上不成立
-
-`design.md` 第 2.1 節與 `protocol.md` 第 3.1 節都把 fallback 當成
-握手失敗後的標準行為。
-
-攻擊：
-
-- 在 TCP 上，即使理論上可以把已讀出的 160 bytes 再轉交給別的處理
-  邏輯，實作上也要求你完全控制 socket 與上游處理器的讀取邊界
-- 在 WebSocket 上，所謂「轉交給本機 Web Server」根本不是同一種
-  協議語義
-- 在 QUIC Stream 上更不成立，因為一條 QUIC stream 不是一個可直接
-  丟給通用 HTTP server 的原始 TCP 連線
-- 也就是說，fallback 不是「協議層普遍成立的能力」，而是某些承載
-  和某些部署拓撲下才可能成立的局部技巧
-
-目前設計卻把它當成通用協議保證，這是錯的。
+- client 是否需要 long-term static key 不明
+- server 是否需要預註冊 client 身份不明
+- 首包密文長度不明
+- 握手 transcript 與 KDF 輸出不明
 
 修正建議：
 
-- fallback 必須被降級為部署策略，而不是協議核心行為
-- 協議只能規定「pre-auth 失敗時不得回送協議特定錯誤」
-- 不能規定「一定能把流轉交給某個本機服務」
-- `design.md` 應明確把 fallback 分成：
-  - 可用於特定承載 / 特定部署的可選能力
-  - 無法 fallback 時的標準行為
+- 先凍結一個單一 Noise pattern
+- 在 `design.md` 只保留最終模式，不要同時出現舊模式
+- 在 `protocol.md` 寫出該模式對 initiator / responder 的前提、消息序列、
+  固定長度與 KDF 輸出
 
-### 2.3 `Not_Before` 不能拿來做時鐘校準
+在這件事修好之前，其他規格都不應繼續往下推。
 
-`design.md` 和 `protocol.md` 都把 `Epoch Cert` 的 `Not_Before` 當成
-客戶端時計修正依據。
+### 2.2 握手長度定義又回到了「概念正確，規格不成立」
 
-攻擊：
+`design.md` 的正文仍然寫 client 首包是 `160 Bytes` 的 `IK` 訊息。
+[design.md:46](/Users/leask/Documents/chameleon/design.md:46)
 
-- 憑證有效期下界不是「當前時間」
-- 它最多只能告訴你「現在不應早於這個值」
-- 如果客戶端時間嚴重漂移，你無法從單個 `Not_Before` 推出正確 offset
-- 文檔卻把它描述成「徹底解決休眠設備時間不準」
+`protocol.md` 則改成 `NK`，但又寫：
 
-這個判斷是錯的，而且會導致實作者在會話有效期與 freshness 上做出
-錯誤假設。
+> 此長度僅為概念計算，實際採用 `NK` 模式時，首包長度可能不同，
+> 核心約束是長度必須固定不變
 
-修正建議：
+[protocol.md:53](/Users/leask/Documents/chameleon/protocol.md:53)
 
-- 把時間校準與憑證有效性分開
-- 如果需要 freshness，定義明確的時間來源與容忍窗口
-- 如果沒有可靠時間來源，就不要把時間同步硬塞給握手證書來解決
+這句話本身就說明：**你們還沒有真的定義握手長度。**
 
-### 2.4 record layer 仍然沒有完整閉環
+如果 wire spec 裡的握手長度只是「概念上應固定」，那麼伺服器就無法
+實作精確讀取，也無法實作 pre-auth 錯誤處理。
 
-雖然 `protocol.md` 已經補了 record header，但還遠稱不上完整。
-
-攻擊：
-
-- header 只有 `Length + Phase`，沒有 version、record type、flags
-- 一旦未來需要擴展 record 語義，沒有正規的欄位空間
-- `Implicit Sequence Number` 完全不傳輸，意味著雙方必須永久嚴格
-  lockstep；任何一次解析錯誤都會直接導致整條連線不可恢復
-- 文檔沒有定義：sequence number 在哪些錯誤路徑上遞增、在哪些路徑
-  上回滾、收到亂序或重複資料時的處理
-- 頭部混淆使用 `Ciphertext` 前 16 bytes 做 sample，但沒有定義當
-  payload 很短時是否可跨 MAC 取樣、最小 record 大小是多少
-- `Header_Protection_Key` 從哪裡來、如何與 transport key 分離、何時
-  輪換，完全沒寫
-
-這表示目前 record layer 只是半成品。
+更糟的是，`protocol.md` 的錯誤處理段落仍然寫「160 Bytes (Client) /
+176 Bytes (Server)」[protocol.md:211](/Users/leask/Documents/chameleon/protocol.md:211)，
+顯然是舊版殘留，已與 `NK` 草案不一致。
 
 修正建議：
 
-- 補齊 header 語義，至少預留 flags / extensibility 空間
-- 明確定義 HP key derivation
-- 明確定義最小 record size
-- 明確定義 seq 在成功、失敗、重試路徑上的規則
+- 握手消息長度必須是規範值，不允許「概念計算」
+- pre-auth 錯誤處理中的長度常數必須與握手規格來源一致
+- 如果長度會隨模式變化，就不能在主規範裡混用多個模式
 
-### 2.5 channel model 還不夠，現在只能算半個代理協議
+### 2.3 `Epoch Cert` 的語義在兩份文檔裡互相打架
 
-`protocol.md` 已經有 `OPEN_CHANNEL / DATA / WINDOW_UPDATE / CLOSE_CHANNEL`，
-這比上一版好很多，但還不夠。
+`design.md` 已明確聲稱：
 
-攻擊：
+- 不再把 `Not_Before` 視為時鐘校準工具
+- 它只承擔 freshness / replay window 語義
 
-- 沒有 `OPEN_ACK`，開啟方無法知道通道究竟已成功建立，還是只是請求
-  已收到
-- `CLOSE_CHANNEL` 同時承擔正常關閉與錯誤關閉，缺少 half-close 語義
-- 對於長連線場景，沒有單獨的 `FIN` 會讓雙向流的關閉語義很粗糙
-- `OPEN_CHANNEL` 只表達目標地址，沒有明確 channel kind，無法區分
-  stream 類與 datagram 類語義
-- 沒有回應碼與失敗原因，客戶端只能等 `CLOSE_CHANNEL` 猜測結果
+[design.md:22](/Users/leask/Documents/chameleon/design.md:22)
 
-修正建議：
+`protocol.md` 也在 `Epoch Cert` 段落旁註寫了同樣意思。
+[protocol.md:72](/Users/leask/Documents/chameleon/protocol.md:72)
 
-- 增加 `OPEN_ACK`
-- 增加單獨的 `FIN` / `RESET`
-- 在 `OPEN_CHANNEL` 中明確 `Channel Kind`
-- 將「通道成功建立」與「通道被關閉」分成不同狀態
+但後面又直接寫：
 
-### 2.6 flow control 是有了，但還沒到能保證穩定的程度
+- 客戶端解密後，根據 `Not_Before_UTC` 與本地時鐘計算 `Clock_Offset`
 
-現在的 credit-based flow control 只做到最表面。
+[protocol.md:86](/Users/leask/Documents/chameleon/protocol.md:86)
 
-攻擊：
+而且欄位名稱在前面已經從 `Not_Before_UTC / Not_After_UTC`
+改成 `Epoch_Window_Start / Epoch_Window_End`，後面卻又回到舊名。
+[protocol.md:64](/Users/leask/Documents/chameleon/protocol.md:64)
 
-- 只有 per-channel window，沒有整體 session 級總量控制
-- 沒有定義當 credit 歸零時，sender 的具體行為
-- 沒有定義是否允許一個 channel 因 overflow 直接拖死整個 session
-- `GOAWAY 0x03` 用於 flow control overflow，這代表單個邏輯通道的錯
-  誤可能把整個連線一起關掉，太粗暴
+這說明兩件事：
+
+- 文檔沒有收斂成單一語義
+- 這一塊不是「還沒寫完」，而是不同版本內容被拼在一起了
 
 修正建議：
 
-- 補 session-level flow control
-- 區分 channel-level overflow 與 session-level fatal error
-- 對單通道違規優先使用 channel reset，而不是 session goaway
+- 明確二選一：
+  - `Epoch Cert` 只表示 freshness window
+  - 或它同時承擔時間對齊，但那就要完整定義校準模型
+- 一旦選定，刪掉另一套敘述，不要保留舊文字
+- 欄位名稱必須全篇一致
 
-### 2.7 `KEY_UPDATE` 幾乎還是空的
+### 2.4 `design.md` 宣稱補齊了 channel lifecycle，但 `protocol.md` 並沒有
 
-`protocol.md` 定義了 `KEY_UPDATE [Next Phase]`，但這還遠不構成可靠的
-金鑰輪換機制。
+`design.md` 在演進摘要裡寫：
 
-攻擊：
+- 引入 `OPEN_ACK`
+- 引入 `FIN`
+- 引入 `RESET`
+- 區分 channel 級與 session 級 flow control
 
-- 沒有寫新 key 如何導出
-- 沒有寫 phase 切換點是「發出此 frame 後」還是「下一個 record 起」
-- 沒有寫接收端允許舊 phase 的重疊窗口
-- 沒有寫雙方同時觸發更新時如何處理
-- 沒有寫 phase bit 重複翻轉後如何避免歧義
+[design.md:23](/Users/leask/Documents/chameleon/design.md:23)
 
-在當前規格下，只要雙方切換時機略有分歧，就會直接進入 AEAD 解密
-失敗，最後連線被硬切。
+但 `protocol.md` 的實際 frame 仍然只有：
 
-修正建議：
+- `OPEN_CHANNEL`
+- `DATA`
+- `WINDOW_UPDATE`
+- `CLOSE_CHANNEL`
 
-- 下一版必須為 rekey 寫獨立狀態機
-- 明確定義 KDF、trigger、overlap window、雙方同時更新規則
-- `KEY_UPDATE` 不能只是一個 1-byte hint
+[protocol.md:127](/Users/leask/Documents/chameleon/protocol.md:127)
 
-### 2.8 設計層聲稱「極致效能」，但規格層還沒有支持這個結論
+這代表設計層已經承認上一版 review 的批評是對的，但規格層根本沒有
+跟進。
 
-`design.md` 把「極低開銷、絲滑體感、高可用自癒」寫得很滿。
+實際後果：
 
-攻擊：
-
-- 當前規格仍然跑在可靠位元組流之上，因此底層若是 TCP / WebSocket，
-  協議天然繼承 HOL
-- 現有 `OPEN_CHANNEL`/`DATA`/`WINDOW_UPDATE` 組合並不足以支撐真正細緻
-  的優先級與公平排程
-- 沒有 transport capability matrix，卻在高階設計裡對「IP 切換」、
-  「高丟包自癒」做了接近通用性的宣稱
-
-這會讓設計層承諾了協議本身根本無法保證的性能。
+- 開啟方仍然無法知道通道是否建立成功
+- 沒有 half-close 語義
+- 正常關閉與錯誤關閉仍然混在同一個 frame
+- 單通道恢復策略無法寫乾淨
 
 修正建議：
 
-- 在 `design.md` 明確區分：
-  - 協議本身保證的東西
-  - 依賴底層承載才成立的東西
-- 不要把 QUIC transport 的特性直接寫成 Chameleon 協議的普遍特性
+- `protocol.md` 補上 `OPEN_ACK`
+- 用 `FIN` 表達半關閉，用 `RESET` 表達錯誤終止
+- `CLOSE_CHANNEL` 若保留，就必須重新定義其責任，不能再與 `FIN/RESET`
+  混疊
 
-### 2.9 `PAD` 已降級為策略，但文檔語氣還沒有完全跟上
+### 2.5 flow control 仍然停留在單通道 credit，沒有落實 session 邊界
 
-這一版已經把 bucketing 拿出核心協議，這是對的。
+`design.md` 明確說本版已區分 channel 級與 session 級 flow control。
+[design.md:23](/Users/leask/Documents/chameleon/design.md:23)
 
-攻擊：
+但 `protocol.md` 裡只有 per-channel 的 `Init Window` 和 `WINDOW_UPDATE`。
+[protocol.md:129](/Users/leask/Documents/chameleon/protocol.md:129)
 
-- `protocol.md` 仍然在 frame 規格裡暗示「發送方可將多個 frame 打包
-  進同一個 record 以對齊特定的 Bucket 尺寸」
-- 這會讓實作者誤以為 bucket 仍然是規範主路徑，而不是可選 transport
-  policy
+沒有任何 session-level credit / receive budget / send budget 的規格。
 
-修正建議：
+這不是小缺口，因為沒有 session 級限額，就意味著：
 
-- 在 `protocol.md` 裡把 `PAD` 明確標註為 optional policy hook
-- 把 bucket 相關描述從規範性文字改成非規範性說明
-
-### 2.10 版本與能力協商還沒有真的落地
-
-兩份文檔都提了 `Version` 和 `Capabilities`，但現在這些欄位還只是空殼。
-
-攻擊：
-
-- `Caps` 目前固定為 `0x00000000`
-- 沒有定義 server response 中哪些 capability 是 echo、哪些是選擇結果
-- 沒有 downgrade / mismatch 規則
-- 沒有未知 capability bit 的處理方式
-- 沒有規定未來新增 frame type 時，舊實作如何降級
+- 只靠多個 channel 疊加就可能吃光整個連線緩衝
+- 你無法保證控制流不被 bulk 流壓死
+- 單通道的錯誤最終還是容易上升為整個 session 的擁塞問題
 
 修正建議：
 
-- 把 capability negotiation 從「欄位存在」提升到「規則存在」
-- 明確寫出：
-  - must-understand bits
-  - optional bits
-  - unknown bits 的處理
-  - version mismatch 的失敗模式
+- 加一組 session 級流控欄位或 control frame
+- 定義 channel 觸頂時的局部處理方式
+- 不要把 `GOAWAY 0x03` 當成單通道 overflow 的默認後果
 
-### 2.11 錯誤處理在兩份文檔裡存在語義衝突
+### 2.6 `KEY_UPDATE` 仍然只是一個標記，不是完整的 rekey 協議
 
-`design.md` 對 pre-auth 錯誤強調靜默與 fallback，
-`protocol.md` 對 record decryption failure 要求直接切底層連線。
+`design.md` 宣稱本版已經「明確金鑰輪換的相位切換狀態機」。
+[design.md:24](/Users/leask/Documents/chameleon/design.md:24)
 
-攻擊：
+但 `protocol.md` 的 `KEY_UPDATE` 還是只有：
 
-- 在 TCP 上的 `RST`、在 QUIC 上的 `CONNECTION_CLOSE`，都不是「什麼都
-  沒發生」
-- 如果你們真的把 `record decryption failure` 視為高風險探測面，
-  那麼底層關閉方式本身也屬於可觀察語義
-- 目前兩份文檔沒有把「pre-auth 靜默」「post-auth 顯式錯誤」
-  「record 失敗時的 transport close semantics」分成一套一致模型
+- `Type`
+- `Next Phase`
+
+[protocol.md:176](/Users/leask/Documents/chameleon/protocol.md:176)
+
+沒有寫：
+
+- 新 key 如何導出
+- phase 何時生效
+- 接收端接受舊 phase 的窗口
+- 雙方同時發起時的衝突處理
+- phase bit 翻轉後如何避免歧義
+
+也就是說，設計層說「已完成」，規格層實際上還在起點。
 
 修正建議：
 
-- 在 `design.md` 裡明確切出三類錯誤：
+- 把 rekey 獨立成一節
+- 寫出 KDF、觸發條件、發送方切換規則、接收方重疊窗口
+- 給 rekey 補一張最小狀態轉換表
+
+### 2.7 capability negotiation 仍然只是欄位，不是規則
+
+`design.md` 說本版已經完善 capabilities 協商。
+[design.md:24](/Users/leask/Documents/chameleon/design.md:24)
+
+實際上兩份文檔裡的 `Caps` 都還是：
+
+- 固定 `0x00000000`
+- 沒有 must-understand bits
+- 沒有 optional bits
+- 沒有 mismatch 行為
+- 沒有 server 如何選擇或回顯的規則
+
+[protocol.md:50](/Users/leask/Documents/chameleon/protocol.md:50)
+
+這表示目前根本不能稱之為 negotiation。
+
+修正建議：
+
+- 明確 capability bit map
+- 明確 unknown bit 的處理
+- 明確 server response 是 echo、mask 還是 selection result
+- 版本與能力不兼容的失敗模式要明確規範
+
+### 2.8 記錄層仍然過度依賴「隱式同步」，恢復能力很弱
+
+兩份文檔都仍然沿用隱式 sequence number：
+
+- 不透過網路傳輸
+- 每次成功處理 record 後遞增
+
+[design.md:80](/Users/leask/Documents/chameleon/design.md:80)
+[protocol.md:94](/Users/leask/Documents/chameleon/protocol.md:94)
+
+這個設計的問題不是不能用，而是你們還沒有把它規格化到可恢復。
+
+缺的內容包括：
+
+- header protection key 如何導出
+- seq 在哪些失敗路徑上遞增，哪些不遞增
+- 當 record parse 失敗但完整性仍合法時怎麼處理
+- 是否允許有限重疊窗口或永遠 lockstep
+
+現在文檔的語氣是「天然提供絕對 replay protection」，
+這個結論說得太滿了。[design.md:80](/Users/leask/Documents/chameleon/design.md:80)
+
+修正建議：
+
+- 把 seq / nonce / hp key 的導出放進同一節
+- 用表格列出每種錯誤對 seq 的影響
+- 若你們選擇嚴格 lockstep，就直接承認這是恢復性與簡潔性的取捨
+
+### 2.9 錯誤處理語義仍然沒有收斂到單一模型
+
+`design.md` 現在前言裡已經把 fallback 降級為部署策略，這是對的。
+[design.md:21](/Users/leask/Documents/chameleon/design.md:21)
+
+但正文裡仍然寫：
+
+- pre-auth 失敗後，把流量原封不動代理給本機 fallback web server
+
+[design.md:50](/Users/leask/Documents/chameleon/design.md:50)
+
+`protocol.md` 則寫：
+
+- pre-auth 錯誤可直接中斷連接或轉交 fallback
+- record decrypt 失敗直接切底層連線
+- logical error 發 `GOAWAY`
+
+[protocol.md:211](/Users/leask/Documents/chameleon/protocol.md:211)
+
+問題在於這三層語義還沒有變成統一矩陣：
+
+- 哪些錯誤一定靜默
+- 哪些錯誤允許控制層信令
+- 哪些錯誤關閉 channel，哪些錯誤關閉 session
+- 哪些錯誤是否可重試
+
+修正建議：
+
+- 補一張統一錯誤矩陣
+- 行至少包括：
   - handshake parse/auth failure
   - record integrity failure
-  - post-auth logical failure
-- 在 `protocol.md` 對應規定每一類錯誤的標準關閉行為
+  - record format failure
+  - channel protocol violation
+  - session fatal error
+- 列至少包括：
+  - 是否發送 frame
+  - 關閉粒度
+  - 是否可重試
+  - 是否依賴部署策略
 
-## 3. 我建議的修正方向
+### 2.10 `design.md` 和 `protocol.md` 的版本邏輯沒有同步更新
 
-### 3.1 把 `design.md` 從「主張」改成「邊界與責任」
+這一輪最明顯的現象是：高階設計先寫了「已修正」，正文和規格文件卻
+還保留舊版內容。
 
-下一版 `design.md` 不應繼續重複「極致、高效、零特徵」這種強結論，
-而應更精確地寫三件事：
+這代表你們現在缺的不是某個 frame，而是**文檔版本治理本身**。
 
-- 協議核心保證什麼
+目前表現出的問題包括：
+
+- 前言與正文衝突
+- 設計文檔與規格文檔衝突
+- 欄位命名更新一半
+- 錯誤處理常數未同步更新
+
+如果這種情況持續，後面就算規格本身漸漸合理，實作者也會被文檔版本
+噪音拖死。
+
+修正建議：
+
+- 每一輪先刪舊內容，再寫新內容，不要讓新舊段落共存
+- `design.md` 只保留高階結論與邊界
+- `protocol.md` 承擔唯一的 wire-level 真相來源
+
+## 3. 我建議的下一步修正方式
+
+### 3.1 先做一次「規格凍結清理」
+
+不要急著加新東西，先把現有文檔裡互相衝突的地方清掉。
+
+本輪最先要清的只有四件事：
+
+1. 最終握手模式
+2. 最終握手長度
+3. `Epoch Cert` 最終語義
+4. channel lifecycle 最終 frame 集
+
+這四件事如果還不鎖死，後面所有 review 都會反覆命中同樣問題。
+
+### 3.2 `design.md` 應收斂成邊界文檔
+
+下一版 `design.md` 不要再重複 wire-level 細節。
+它應只回答：
+
+- 協議要解什麼問題
+- 不解什麼問題
 - 控制面前提是什麼
-- 哪些能力取決於特定承載或特定部署
+- 底層承載能力如何影響協議邊界
+- 哪些是核心強保證，哪些是部署層可選策略
 
-這樣 `protocol.md` 才不會被迫背負設計層過度承諾。
+### 3.3 `protocol.md` 應成為唯一規格來源
 
-### 3.2 把 `protocol.md` 補成真正的閉環協議
+下一版 `protocol.md` 應承擔唯一真相來源，至少補齊：
 
-下一版 `protocol.md` 至少要補齊以下幾塊：
-
-- 握手模式前提
-- HP key derivation
-- record 最小長度與錯誤路徑
-- `OPEN_ACK`
-- `FIN` / `RESET`
+- 單一握手模式及消息長度
+- KDF 與 key schedule
+- header protection key derivation
+- capability negotiation 規則
+- `OPEN_ACK` / `FIN` / `RESET`
 - session-level flow control
 - rekey state machine
-- capability negotiation rules
+- 統一錯誤矩陣
 
-### 3.3 給錯誤處理一個統一模型
+## 4. 下一版必答問題
 
-不要再用分散在設計文案和協議條文裡的描述來定義錯誤。
-
-應該直接列一張矩陣：
-
-- 錯誤類型
-- 所在層
-- 是否可觀測
-- 是否發送控制 frame
-- 關閉粒度是 channel 還是 session
-- 是否允許重試
-
-### 3.4 下一版應補一張真正的狀態機圖
-
-我不是要抽象狀態名稱，而是要真正有事件、轉移與動作的表。
-
-至少要有：
-
-- handshake state machine
-- record key phase machine
-- channel lifecycle machine
-- goaway / draining machine
-
-沒有這四張表，協議仍然只是在靠文字敘述維持一致性。
-
-## 4. 我認為下一版必須回答的問題
-
-1. 你們真的需要 `IK`，還是只是需要「client 預知 server key」？
-2. fallback 是協議能力，還是部署能力？
-3. `Epoch Cert` 到底承擔的是 freshness、有效期，還是時間同步？
-4. header protection key 從哪裡導出？
-5. record sequence 在哪些錯誤路徑上遞增？
-6. channel 成功建立怎麼回報？
-7. 單通道失控時，為什麼要拖垮整個 session？
-8. `KEY_UPDATE` 的 phase 切換如何避免雙方不同步？
-9. `Capabilities` 的 bit 語義與 mismatch 規則是什麼？
-10. 哪些性能特性是協議保證，哪些只是某個 transport 的特性？
+1. 最終握手模式到底是 `IK` 還是 `NK`？
+2. client 首包固定長度到底是多少？
+3. `Epoch Cert` 是 freshness window，還是時間同步工具？
+4. `OPEN_ACK`、`FIN`、`RESET` 是否真的進協議？
+5. session-level flow control 如何表達？
+6. `KEY_UPDATE` 的 phase 切換規則是什麼？
+7. capability negotiation 的 bit 語義和 mismatch 規則是什麼？
+8. pre-auth / post-auth / channel / session 的錯誤矩陣是什麼？
 
 ## 5. 結論
 
-這一版的真實進步，在於你們終於開始同時寫「設計層」與「規格層」。
-這是對的。
+本輪最大的問題不是協議方向錯，而是**文檔已經失去單一真相來源**。
 
-但我對目前版本的最直接判斷仍然是：
+我對當前版本的直接判斷是：
 
-**它已經比上一版更像協議了，但它還沒有到「兩個獨立團隊按規格寫，
-就一定能互通且行為一致」的程度。**
+**它現在最缺的不是新的設計靈感，而是一次嚴格的規格收斂。**
 
-當前最需要補的不是更多新點子，而是把以下幾個位置徹底做實：
+如果不先把 `design.md` 和 `protocol.md` 收斂到單一一致版本，
+那麼你們下一輪即使補再多內容，review 也只會反覆指出同一件事：
 
-- 握手模式與控制面前提
-- fallback 的適用邊界
-- record layer 的完整性
-- channel lifecycle
-- rekey 規則
-- version / capability negotiation
-
-把這六件事補齊，下一版才有資格從「像協議」走到「真協議」。
+**文檔在說兩套不同的協議。**
