@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v2.0
+# Chameleon 網路通訊協議規格書 v3.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -17,14 +17,21 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 4. **控制層 (Control Layer)**: 負責會話級信令、金鑰輪換與錯誤恢復。
 
 ### 1.1 位元組序與約定
-* 所有整數欄位均使用**大端序 (Network Byte Order)**。
+* 所有整數欄位（16-bit, 32-bit, 64-bit）均使用**大端序 (Big-Endian, Network Byte Order)**。
 * 基礎承載假設為**無損、保序的可靠位元組流**（Reliable in-order byte stream）。
+* 密碼學金鑰與雜湊值以位元組陣列 (Byte Array) 處理。
+
+### 1.2 密碼學標準參考 (Cryptographic Standards)
+* **ChaCha20-Poly1305**: RFC 8439
+* **Noise Protocol Framework**: RFC 7748 (Curve25519)
+* **HKDF**: RFC 5869
 
 ---
 
 ## 2. 密碼學原語與密鑰導出 (Cryptographic Primitives)
 
 * **Handshake Pattern**: Noise `NK` (`Noise_NK_25519_ChaChaPoly_BLAKE2s`)
+* **Prologue**: `b"chameleon-v1"` (ASCII 編碼，不含 null 終止符，共 12 Bytes)。雙方在初始化 Noise 狀態機時必須輸入此 Prologue，防止跨協議重放攻擊。
 
 ### 2.1 初始金鑰導出 (Initial Key Schedule)
 握手完成後，Noise 狀態機的 `Split()` 函數會輸出兩個 32 Bytes 的對稱金鑰（記為 `cs1`, `cs2`）。
@@ -175,7 +182,9 @@ Noise `NK` 第二條訊息的序列化：
 | Type(1) | Channel ID(4)| Kind(1) | Init Window (4) | ATYP(1)| Target Length (1)* | Target(Var) | Port(2) |
 +---------+--------------+---------+-----------------+--------+--------------------+-------------+---------+
 ```
-* `Channel ID`: 發起方保證全域唯一（Client奇數，Server偶數）。
+* `Channel ID`: 發起方保證全域唯一，最大允許值為 `2^30 - 1`。
+  * **分配規則 (MUST)**: 客戶端發起的 ID 必須是**奇數** (1, 3, 5...)，伺服器發起的 ID 必須是**偶數** (2, 4, 6...)。
+  * **單調遞增 (Monotonicity)**: 雙方發起的新 `Channel ID` 必須嚴格單調遞增。若接收方收到一個小於或等於已見過最高 ID 的 `OPEN_CHANNEL`，必須視為協議違規，立即發送 `GOAWAY (Code: 0x02)` 並中斷連線。
 * `Kind`: 必須為 `0x01` (TCP Stream)。`0x02` (UDP Datagram) 暫為保留能力。
 * `Init Window`: 允許對端發送的初始位元組數 (Channel-level Flow Control)。
 * `ATYP` (SOCKS5 衍生標準):
