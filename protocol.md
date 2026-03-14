@@ -102,6 +102,7 @@ Noise `NK` 第二條訊息的序列化：
 | AEAD Ciphertext (Payload + 16 bytes MAC)         |  
 +--------------------------------------------------+
 ```
+* `Length` (2 bytes): 表示整個 Ciphertext 的總長度（**包含 16 Bytes 的 MAC Tag**）。即 `Payload Length + 16`。最大允許值 `16384` (16KB)。最小允許值 `16` (Payload 為空)。
 * `Flags` (1 byte): `[Key Phase (1 bit)] [Reserved (7 bits, 須為 0)]`。
 * `Sample` 的獲取：取 `Ciphertext` 的前 16 Bytes。如果 `Ciphertext` 總長度小於 16 Bytes，則在末尾補 `0x00` 直到湊齊 16 Bytes（僅用於取樣，不改變實際傳輸資料）。
 * `Mask = ChaCha20(HP_Key, Sample)[0..2]` (以 0 為 Nonce 與 Counter)。
@@ -110,6 +111,15 @@ Noise `NK` 第二條訊息的序列化：
 ---
 
 ## 5. 幀格式規格 (Frame Formats)
+
+### 5.0 客戶端授權 (Client Authentication)
+#### `0x00` CLIENT_AUTH (客戶端身分驗證)
+```text
++---------+------------------+-----------------------------+
+| Type(1) | Device ID (16)   | Auth Token / Signature (32) |
++---------+------------------+-----------------------------+
+```
+**強制規範 (MUST)**: 握手完成後，客戶端發送的第一個 Record 的第一個 Frame **必須**是 `CLIENT_AUTH`。此幀負責實際的客戶端身份授權與設備權限綁定。若驗證失敗，伺服器必須立即發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
 
 ### 5.1 通道層 Frames (Channel Lifecycle & Multiplexing)
 
