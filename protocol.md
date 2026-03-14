@@ -27,7 +27,11 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 * **Handshake Pattern**: Noise `NK` (`Noise_NK_25519_ChaChaPoly_BLAKE2s`)
 
 ### 2.1 初始金鑰導出 (Initial Key Schedule)
-握手完成後，Noise 狀態機會輸出兩個對稱金鑰（`cs1`, `cs2`）。Chameleon 使用這兩個金鑰作為 IKM (Input Keying Material) 進行 HKDF-Expand 導出所需的流量與混淆金鑰：
+握手完成後，Noise 狀態機的 `Split()` 函數會輸出兩個 32 Bytes 的對稱金鑰（記為 `cs1`, `cs2`）。
+* `cs1` 用於 **Initiator to Responder (Client -> Server)** 方向。
+* `cs2` 用於 **Responder to Initiator (Server -> Client)** 方向。
+
+Chameleon 不直接使用 `cs1/cs2` 進行加密，而是將其作為 PRK (Pseudorandom Key) 進行 `HKDF-Expand` (Hash = BLAKE2s) 以分離 Traffic Key 和 HP Key：
 
 1. **Client -> Server 方向**:
    * `C2S_Traffic_Key = HKDF-Expand(cs1, "c2s_traffic", 32)`
@@ -38,7 +42,7 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
    * `S2C_HP_Key = HKDF-Expand(cs2, "s2c_hp", 32)`
    * `S2C_ChaCha_IV = HKDF-Expand(cs2, "s2c_iv", 12)`
 
-*(註：HKDF 使用的 Hash 演算法為 BLAKE2s)*
+*(註：Info 字串轉換為 ASCII bytes，不含 Null 終止符。)*
 
 ---
 
@@ -102,7 +106,8 @@ Noise `NK` 第二條訊息的序列化：
 ### 4.1 隱式序號與鎖步防重放 (Strict Lockstep Sequence)
 * 雙方各自維護 `SendSeq` 與 `RecvSeq` (初始為 0)。
 * **絕對順序保證**: 因為底層是可靠流，`RecvSeq` 必須與收到的 Record 嚴格一一對應。**不允許亂序，不允許跳號**。
-* `Nonce = ChaCha_IV XOR Pad_Zero(Sequence_Number)`。
+* AEAD 每次加密/解密的 `Nonce` (12 Bytes) 計算方式：將 64-bit 的 Sequence Number 編碼為 8 Bytes 的大端序 (Big-Endian) 位元組陣列，在其左側填充 4 Bytes 的 `0x00` 構成 12 Bytes。然後將這 12 Bytes 與對應方向的 `ChaCha_IV` 進行 XOR 運算：
+  `Nonce = ChaCha_IV XOR ( 0x00000000 || BigEndian(Sequence_Number) )`。
 * 任何 AEAD MAC 驗證失敗，意味著位元組流已被污染或發生了未經授權的篡改，**必須立即硬關閉底層傳輸 (Hard Close)**。
 
 ### 4.2 Record 結構與頭部混淆 (Header Protection)
@@ -115,14 +120,16 @@ Noise `NK` 第二條訊息的序列化：
 ```
 * `Length` (2 bytes): 表示整個 Ciphertext 的總長度（**包含 16 Bytes 的 MAC Tag**）。即 `Payload Length + 16`。最大允許值 `16384` (16KB)。最小允許值 `16` (Payload 為空)。
 * `Flags` (1 byte): `[Key Phase (1 bit)] [Reserved (7 bits, 須為 0)]`。
-* `Sample` 的獲取：取 `Ciphertext` 的前 16 Bytes。如果 `Ciphertext` 總長度小於 16 Bytes，則在末尾補 `0x00` 直到湊齊 16 Bytes（僅用於取樣，不改變實際傳輸資料）。
-* **精確混淆演算法**: 使用標準 ChaCha20 區塊加密。
-  * `Key` = `HP_Key` (32 Bytes)
-  * `Nonce` = `0x000000000000000000000000` (12 Bytes of Zeros)
-  * `Block Counter` = `0` (Initial Block)
-  * 生成一個 64 Bytes 的 Keystream Block。
-  * `Mask` = 截取此 Keystream Block 的前 3 Bytes。
+* **精確混淆演算法**: 我們使用 `Sample` 作為 ChaCha20 的 Nonce 輸入，確保每個 Record 的 Mask 都是動態且不可預測的。
+  1. `Sample` 擷取：取 `Ciphertext` 的前 12 Bytes。如果 `Ciphertext` 總長度大於等於 16 Bytes，直接取前 12 Bytes。如果小於 12 Bytes（協議邏輯上最小為 16，但為防禦極端惡意截斷），不足部分在末尾補 `0x00`。
+  2. `Mask` 生成：使用標準 ChaCha20 區塊加密。
+     * `Key` = `HP_Key` (32 Bytes)
+     * `Nonce` = `Sample` (12 Bytes)
+     * `Block Counter` = `0`
+     * 生成 64 Bytes 的 Keystream，截取前 3 Bytes 作為 `Mask`。
 * `Obfuscated_Header = (Length || Flags) XOR Mask`。
+
+* **解析器行為 (Parser Discipline)**: 接收方先讀取 3 Bytes 的 `Obfuscated_Header`。接著向前**預讀 (Peek)** 後續的 12 Bytes 作為 `Sample`。使用 `HP_Key` 和 `Sample` 計算出 Mask 後，反解出 `Length` 與 `Flags`。最後根據 `Length` 繼續讀取完整的 Ciphertext 進行 AEAD 解密。
 
 ---
 
@@ -192,7 +199,12 @@ Noise `NK` 第二條訊息的序列化：
 
 ### 5.2 流量控制 Frames (Flow Control)
 
-**初始條件 (Initial Constraints)**: 握手完成後，預設的 Channel Initial Window 為 0，預設的 **Session Initial Window 為 10MB**（雙向獨立）。`DATA` 幀的發送會同時消耗 Channel Credit 與 Session Credit，任意一個 Credit 不足時，發送方必須阻塞。`PAD` 與所有控制幀（如 `PING`, `WINDOW_UPDATE`）**不消耗**任何 Credit。
+**初始條件 (Initial Constraints)**: 握手完成後，預設的 Channel Initial Window 為 0，預設的 **Session Initial Window 為 10MB**（雙向獨立）。`DATA` 幀的發送會同時消耗 Channel Credit 與 Session Credit，任意一個 Credit 不足時，發送方必須阻塞。`PAD` 與所有控制幀（如 `PING`, `WINDOW_UPDATE`）**絕對不消耗**任何 Session 或 Channel Credit。
+
+**調度器優先級 (Scheduler Priority)**:
+發送方在組合 Record 時，必須遵守以下硬性優先級，確保流量特徵填充不會打穿資源約束：
+`Auth / Critical Control (GOAWAY, KEY_UPDATE)` > `Flow Control (WINDOW_UPDATE)` > `DATA / OPEN_CHANNEL` > `PAD`
+**強制規範 (MUST)**: `PAD` 幀絕對不可餓死 (Starve) 任何認證流量或資料流量。`PAD` 的發送僅受制於控制面下發的 Session-level Egress Budget（如每秒最大填充字節數）。
 
 #### `0x06` CHANNEL_WINDOW_UPDATE
 ```text
@@ -229,7 +241,9 @@ Noise `NK` 第二條訊息的序列化：
 | Type(1)  | Error Code (4 bytes)    | Last Accepted Channel ID (4)  |
 +----------+-------------------------+-------------------------------+
 ```
-通知對端會話即將關閉。不再接受新的 `OPEN_CHANNEL`。`Last Accepted Channel ID` 解決了排空 (Draining) 期間的 Race Condition 歧義：所有在此 ID 之後發起的開啟請求皆被視為隱式拒絕。
+通知對端會話即將關閉。接收方收到此幀後，不再發送任何新的 `OPEN_CHANNEL`。
+**Draining 與 Race Condition 消除**: 
+`Last Accepted Channel ID` 明確劃定了排空 (Draining) 邊界。對於接收方來說，所有已發出且 Channel ID **大於**此值的 `OPEN_CHANNEL` 請求，皆視為被發送方**隱式拒絕 (Implicitly Rejected)**，必須立即釋放關聯資源；小於或等於此值的通道允許繼續 Draining 直至 `FIN`。
 **錯誤碼矩陣:**
 * `0x00`: 優雅退出 (如伺服器進入維護、憑證即將到期)。
 * `0x01`: 內部錯誤。
