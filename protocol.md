@@ -197,6 +197,25 @@ Noise `NK` 第二條訊息的序列化：
   * `Next_HP_Key = HKDF-Expand(Current_HP_Key, "hp_rekey", 32)`
 * **接收方行為**: 收到 `KEY_UPDATE` 後，計算出兩把新金鑰。當收到下一個 Record 發現 `Key Phase` 翻轉時，使用新金鑰解除頭部混淆與解密。接收方也應盡快發送自己的 `KEY_UPDATE` 以完成雙向輪換。為避免歧義，連續兩次 `KEY_UPDATE` 之間必須相隔至少 1000 個 Records 或 1 分鐘。
 
+#### `0x13` GOAWAY (會話級致命錯誤)
+```text
++----------+-------------------------+-------------------------------+
+| Type(1)  | Error Code (4 bytes)    | Last Accepted Channel ID (4)  |
++----------+-------------------------+-------------------------------+
+```
+通知對端會話即將關閉。不再接受新的 `OPEN_CHANNEL`。`Last Accepted Channel ID` 解決了排空 (Draining) 期間的 Race Condition 歧義：所有在此 ID 之後發起的開啟請求皆被視為隱式拒絕。
+**錯誤碼矩陣:**
+* `0x00`: 優雅退出 (如伺服器進入維護、憑證即將到期)。
+* `0x01`: 內部錯誤。
+* `0x02`: 協議違規 (如未知的 Frame Type)。
+* `0x03`: 流量控制溢出 (Flow Control Overflow)。
+* `0x04`: 解密/完整性違規。
+* `0x05`: 客戶端授權失敗 (Auth Failed)。
+
+#### `0xFF` PAD (流量特徵填充)
+`[Type(1)] [Pad Length (2 bytes)] [Padding Bytes...]`
+傳輸策略 (Transport Policy) 可插入此幀以湊齊特定的 Record 大小。接收方**必須安全忽略**。**此幀絕對不消耗任何 Channel 或 Session 的 Flow Control Credit**，它只受制於控制面下發的獨立 Shaping/Padding Budget。
+
 ---
 
 ## 6. 錯誤處理矩陣 (Error Handling Matrix)
@@ -205,6 +224,7 @@ Noise `NK` 第二條訊息的序列化：
 | :--- | :--- | :--- | :--- | :--- |
 | **Handshake Length Mismatch** | Handshake | 否 | 靜默丟棄 (Silent Drop)，斷開底層或 Fallback。 | Session |
 | **Handshake AEAD / MAC Fail** | Handshake | 否 | 靜默丟棄 (Silent Drop)，斷開底層或 Fallback。 | Session |
+| **Client Auth Fail (Token 錯誤)**| Auth     | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x05)`，硬關閉。 | Session |
 | **Record Header De-obfuscate Fail** | Record | 是 (TCP RST) | 硬關閉底層連線 (Transport Close)，無錯誤幀。 | Session |
 | **Record AEAD MAC Fail / 亂序** | Record | 是 (TCP RST) | 視為流污染。硬關閉底層連線，無錯誤幀。 | Session |
 | **Channel Flow Control Overflow** | Channel | 是 (RESET Frame)| 發送 `RESET_CHANNEL (Code: 0x03)`。 | **Channel** |
