@@ -82,20 +82,22 @@ Noise `NK` 第一條訊息的序列化：
 ### 3.2 握手回應 (Server -> Client)
 **Noise Transcript (Responder -> Initiator)**: `<- e, ee`
 
-**1. 紀元憑證 (Epoch Cert) 結構 (112 Bytes):**
+**1. 紀元憑證 (Epoch Cert) 結構 (120 Bytes):**
 ```text
 +-----------------------------------+-----------------------------------+
 | Server Static Pubkey (32 bytes)   | Epoch_Window_Start (8 bytes, 秒數)|
 +-----------------------------------+-----------------------------------+
-| Epoch_Window_End (8 bytes, 秒數)  | Ed25519 Control Plane Sig (64 b)  |
+| Epoch_Window_End (8 bytes, 秒數)  | Signer Key ID (8 bytes)           |
++-----------------------------------+-----------------------------------+
+| Ed25519 Control Plane Sig (64 b)                                      |
 +-----------------------------------+-----------------------------------+
 ```
-*(提供防重放的時間新鮮度視窗)*
+*(提供防重放的時間新鮮度視窗與兩級信任鏈綁定)*
 
 **2. 構造明文 Payload (128 Bytes 固定長度):**
 ```text
 +-------------------+-------------------+-------------------+---------------+
-| Version (1 byte)  | Selected Caps (4) | Epoch Cert (112 b)| Pad (11 bytes)|
+| Version (1 byte)  | Selected Caps (4) | Epoch Cert (120 b)| Pad (3 bytes) |
 +-------------------+-------------------+-------------------+---------------+
 ```
 
@@ -109,7 +111,7 @@ Noise `NK` 第二條訊息的序列化：
 ### 3.3 Epoch Cert 驗證演算法 (Epoch Cert Verification Algorithm)
 接收到伺服器的 `Epoch Cert` 後，客戶端**必須 (MUST)** 執行以下嚴格的驗證步驟。任何一步失敗，必須立即中斷連線並丟棄金鑰：
 
-1. **Signer Trust Root 校驗**: 客戶端必須預先透過控制面 (OOB) 獲取 Root CA 的 Ed25519 公鑰。使用此公鑰驗證 `Epoch Cert` 後 64 Bytes 的 `Ed25519 Control Plane Sig`。簽名的 Message 內容為 `Epoch Cert` 的前 48 Bytes (`Server Static Pubkey` || `Epoch_Window_Start` || `Epoch_Window_End`)。
+1. **Signer Trust Root 校驗 (兩級 PKI)**: 客戶端必須預先透過 OOB 獲取由離線 Root CA 簽發的線上控制面簽發金鑰 (`CPSK`, Control Plane Signing Key) 憑證。客戶端提取 `Epoch Cert` 中的 `Signer Key ID`，從本地信任庫中找出對應的有效 `CPSK` 公鑰。使用此 `CPSK` 公鑰驗證 `Epoch Cert` 後 64 Bytes 的 `Ed25519 Control Plane Sig`。簽名的 Message 內容為 `Epoch Cert` 的前 56 Bytes (`Server Static Pubkey` || `Epoch_Window_Start` || `Epoch_Window_End` || `Signer Key ID`)。
 2. **Responder Key 綁定校驗**: 提取 `Epoch Cert` 中的 32 Bytes `Server Static Pubkey`，並與本次 Noise `NK` 握手前客戶端所使用的預期伺服器公鑰進行絕對比對 (恆等校驗)。若不一致，代表伺服器身份被劫持或節點串線，立即失敗。
 3. **新鮮度視窗與時鐘容忍 (Freshness Window & Clock Skew)**:
    * 獲取客戶端目前的絕對時間 (UTC 秒數)，記為 `Now`。
@@ -170,8 +172,10 @@ Noise `NK` 第二條訊息的序列化：
 3. **驗證演算法 (Auth Scheme 0x01: Ed25519 Transcript Binding)**:
    * `Credential ID`: 作為索引，用於在控制面下發的使用者資料庫中查找對應的 Client Ed25519 Public Key。
    * `Proof Length`: 固定為 `64` (Bytes)。
-   * `Proof`: 客戶端使用其 Ed25519 私鑰，對**當前連線的 Noise 握手 Transcript Hash** (即 Noise 狀態機握手完成時的 `h` 變數，32 Bytes) 進行數位簽章。
-   * **安全性**: 此設計將客戶端的長期身份 (`Credential ID`) 與這一次特定的物理連線 (`Transcript Hash`) 進行密碼學綁定，徹底杜絕了 Auth Token 被跨連線重放的可能。
+   * **Domain Separation 與綁定**: 客戶端使用其 Ed25519 私鑰，對特定的 Context String 與**當前連線的 Noise 握手 Transcript Hash** 進行拼接後簽章。
+     `Proof = Sign( Private_Key, "chameleon-auth-v1" || h )`
+     (其中 `"chameleon-auth-v1"` 為 ASCII 編碼，不含 null，共 17 Bytes；`h` 即 Noise 狀態機握手完成時輸出的 32 Bytes Hash 變數)。
+   * **安全性**: 此設計將客戶端的長期身份 (`Credential ID`) 與這一次特定的物理連線 (`Transcript Hash`) 進行了上下文隔離的密碼學綁定，徹底杜絕了 Auth Token 被跨連線、跨協議重放的可能。
 4. 伺服器若驗證失敗（ID 不存在、簽名錯誤、或該 ID 已被撤銷），必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
 
 ### 5.1 通道層 Frames (Channel Lifecycle & Multiplexing)
@@ -185,6 +189,7 @@ Noise `NK` 第二條訊息的序列化：
 * `Channel ID`: 發起方保證全域唯一，最大允許值為 `2^30 - 1`。
   * **分配規則 (MUST)**: 客戶端發起的 ID 必須是**奇數** (1, 3, 5...)，伺服器發起的 ID 必須是**偶數** (2, 4, 6...)。
   * **單調遞增 (Monotonicity)**: 雙方發起的新 `Channel ID` 必須嚴格單調遞增。若接收方收到一個小於或等於已見過最高 ID 的 `OPEN_CHANNEL`，必須視為協議違規，立即發送 `GOAWAY (Code: 0x02)` 並中斷連線。
+  * **ID 耗盡防護 (Exhaustion Watermark)**: 當客戶端下一個可分配的 `Channel ID` 超過 `2^30 - 100` 時，客戶端必須主動發送 `GOAWAY (Code: 0x00)` 並進入 Draining 狀態，並通知 Session Pool Manager 建立新的替代 Session。
 * `Kind`: 必須為 `0x01` (TCP Stream)。`0x02` (UDP Datagram) 暫為保留能力。
 * `Init Window`: 允許對端發送的初始位元組數 (Channel-level Flow Control)。
 * `ATYP` (SOCKS5 衍生標準):
