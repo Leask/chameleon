@@ -116,7 +116,12 @@ Noise `NK` 第二條訊息的序列化：
 * `Length` (2 bytes): 表示整個 Ciphertext 的總長度（**包含 16 Bytes 的 MAC Tag**）。即 `Payload Length + 16`。最大允許值 `16384` (16KB)。最小允許值 `16` (Payload 為空)。
 * `Flags` (1 byte): `[Key Phase (1 bit)] [Reserved (7 bits, 須為 0)]`。
 * `Sample` 的獲取：取 `Ciphertext` 的前 16 Bytes。如果 `Ciphertext` 總長度小於 16 Bytes，則在末尾補 `0x00` 直到湊齊 16 Bytes（僅用於取樣，不改變實際傳輸資料）。
-* `Mask = ChaCha20(HP_Key, Sample)[0..2]` (以 0 為 Nonce 與 Counter)。
+* **精確混淆演算法**: 使用標準 ChaCha20 區塊加密。
+  * `Key` = `HP_Key` (32 Bytes)
+  * `Nonce` = `0x000000000000000000000000` (12 Bytes of Zeros)
+  * `Block Counter` = `0` (Initial Block)
+  * 生成一個 64 Bytes 的 Keystream Block。
+  * `Mask` = 截取此 Keystream Block 的前 3 Bytes。
 * `Obfuscated_Header = (Length || Flags) XOR Mask`。
 
 ---
@@ -126,23 +131,33 @@ Noise `NK` 第二條訊息的序列化：
 ### 5.0 客戶端授權 (Client Authentication)
 #### `0x00` CLIENT_AUTH (客戶端身分驗證)
 ```text
-+---------+------------------+-----------------------------+
-| Type(1) | Device ID (16)   | Auth Token / Signature (32) |
-+---------+------------------+-----------------------------+
++---------+----------------+----------------+------------------+-------------+
+| Type(1) | Auth Scheme(1) | Credential ID(8)| Proof Length (2) | Proof (Var) |
++---------+----------------+----------------+------------------+-------------+
 ```
-**強制規範 (MUST)**: 握手完成後，客戶端發送的第一個 Record 的第一個 Frame **必須**是 `CLIENT_AUTH`。此幀負責實際的客戶端身份授權與設備權限綁定。若驗證失敗，伺服器必須立即發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
+**強制規範 (MUST)**: 握手完成後，客戶端進入 **Provisional Session (臨時會話)**。此狀態下：
+1. 第一個 Record 的第一個 Frame **必須**是 `CLIENT_AUTH`。
+2. 伺服器在收到此幀之前，**絕對禁止**處理任何 `OPEN_CHANNEL` 或 `DATA` 請求。
+3. 伺服器必須設定嚴格的 Provisional 超時時間 (如 3 秒) 與最大接收字節數 (如 1KB)。超時或越界立即 `Abort Transport`。
+* `Auth Scheme`: `0x01` (預設，使用 Ed25519 簽名綁定握手 Transcript Hash)，其他值保留。
+* `Credential ID`: 設備或使用者的唯一標識。
+* `Proof`: 基於 `Auth Scheme` 生成的授權證明。若驗證失敗，伺服器必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
 
 ### 5.1 通道層 Frames (Channel Lifecycle & Multiplexing)
 
 #### `0x01` OPEN_CHANNEL (開啟通道)
 ```text
-+---------+--------------+---------+-----------------+--------+------------+-------+
-| Type(1) | Channel ID(4)| Kind(1) | Init Window (4) | ATYP(1)| Target(Var)| Port(2)|
-+---------+--------------+---------+-----------------+--------+------------+-------+
++---------+--------------+---------+-----------------+--------+--------------------+-------------+---------+
+| Type(1) | Channel ID(4)| Kind(1) | Init Window (4) | ATYP(1)| Target Length (1)* | Target(Var) | Port(2) |
++---------+--------------+---------+-----------------+--------+--------------------+-------------+---------+
 ```
 * `Channel ID`: 發起方保證全域唯一（Client奇數，Server偶數）。
-* `Kind`: 必須為 `0x01` (TCP Stream)。`0x02` 等其他類型保留。
+* `Kind`: 必須為 `0x01` (TCP Stream)。`0x02` (UDP Datagram) 暫為保留能力。
 * `Init Window`: 允許對端發送的初始位元組數 (Channel-level Flow Control)。
+* `ATYP` (SOCKS5 衍生標準):
+  * `0x01`: IPv4 (`Target` 固定 4 Bytes，**無** `Target Length` 欄位)
+  * `0x03`: Domain (**包含** 1 Byte 的 `Target Length` 欄位，後接 ASCII 域名，不含 Null 終止符)
+  * `0x04`: IPv6 (`Target` 固定 16 Bytes，**無** `Target Length` 欄位)
 
 #### `0x02` OPEN_ACK (確認通道開啟)
 ```text
@@ -229,15 +244,16 @@ Noise `NK` 第二條訊息的序列化：
 
 ---
 
-## 6. 錯誤處理矩陣 (Error Handling Matrix)
+## 6. 錯誤處理與恢復矩陣 (Error Handling & Recovery Matrix)
 
-| 錯誤情境 (Error Scenario) | 所在層級 | 是否可觀測 | 協議行為 (Protocol Action) | 關閉粒度 |
-| :--- | :--- | :--- | :--- | :--- |
-| **Handshake Length Mismatch** | Handshake | 否 | 靜默丟棄 (Silent Drop)。 | Session |
-| **Handshake AEAD / MAC Fail** | Handshake | 否 | 靜默丟棄 (Silent Drop)。 | Session |
-| **Client Auth Fail (Token 錯誤)**| Auth     | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x05)`，然後 `Abort Transport`。 | Session |
-| **Record Header De-obfuscate Fail** | Record | 是 (底層關閉) | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Session |
-| **Record AEAD MAC Fail / 亂序** | Record | 是 (底層關閉) | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Session |
-| **Channel Flow Control Overflow** | Channel | 是 (RESET Frame)| 發送 `RESET_CHANNEL (Code: 0x03)`。 | **Channel** |
-| **Unknown Frame Type** | Control | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x02)`，進入 Draining。 | Session |
-| **Session Flow Control Overflow** | Control | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x04)`，然後 `Abort Transport`。 | Session |
+| 錯誤情境 (Error Scenario) | 所在層級 | 伺服器動作 (Server Action) | 客戶端恢復策略 (Client Recovery) |
+| :--- | :--- | :--- | :--- |
+| **Handshake Length Mismatch** | Handshake | 靜默丟棄 (Silent Drop)。 | Retry Different Node |
+| **Handshake AEAD / MAC Fail** | Handshake | 靜默丟棄 (Silent Drop)。 | Retry Different Node |
+| **Client Auth Fail (Token 錯誤)**| Auth     | 發送 `GOAWAY (Code: 0x05)`，然後 `Abort Transport`。 | Require Config Refresh (Do Not Retry) |
+| **Record Header De-obfuscate Fail** | Record | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Retry Same Node (If transient) / Switch Node |
+| **Record AEAD MAC Fail / 亂序** | Record | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Retry Same Node (If transient) / Switch Node |
+| **Channel Flow Control Overflow** | Channel | 發送 `RESET_CHANNEL (Code: 0x03)`。 | Retry Channel (App layer decision) |
+| **Unknown Frame Type** | Control | 發送 `GOAWAY (Code: 0x02)`，進入 Draining。 | Retry Same Node (Version mismatch check) |
+| **Session Flow Control Overflow** | Control | 發送 `GOAWAY (Code: 0x04)`，然後 `Abort Transport`。 | Retry Same Node (Rate limit applied) |
+| **Server Maintenance/Epoch Expiring**| Control | 發送 `GOAWAY (Code: 0x00)`，進入 Draining。 | Switch Node (Graceful shift) |
