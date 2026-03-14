@@ -25,9 +25,20 @@ Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC
 ## 2. 密碼學原語與密鑰導出 (Cryptographic Primitives)
 
 * **Handshake Pattern**: Noise `NK` (`Noise_NK_25519_ChaChaPoly_BLAKE2s`)
-* **流量金鑰導出 (Traffic Keys)**: 握手完成後，導出以下金鑰：
-  * `Client_to_Server_Key`, `Server_to_Client_Key` (32 Bytes, 用於 AEAD 加密 Payload)
-  * `Client_to_Server_HP_Key`, `Server_to_Client_HP_Key` (32 Bytes, 用於 Header 混淆)
+
+### 2.1 初始金鑰導出 (Initial Key Schedule)
+握手完成後，Noise 狀態機會輸出兩個對稱金鑰（`cs1`, `cs2`）。Chameleon 使用這兩個金鑰作為 IKM (Input Keying Material) 進行 HKDF-Expand 導出所需的流量與混淆金鑰：
+
+1. **Client -> Server 方向**:
+   * `C2S_Traffic_Key = HKDF-Expand(cs1, "c2s_traffic", 32)`
+   * `C2S_HP_Key = HKDF-Expand(cs1, "c2s_hp", 32)`
+   * `C2S_ChaCha_IV = HKDF-Expand(cs1, "c2s_iv", 12)`
+2. **Server -> Client 方向**:
+   * `S2C_Traffic_Key = HKDF-Expand(cs2, "s2c_traffic", 32)`
+   * `S2C_HP_Key = HKDF-Expand(cs2, "s2c_hp", 32)`
+   * `S2C_ChaCha_IV = HKDF-Expand(cs2, "s2c_iv", 12)`
+
+*(註：HKDF 使用的 Hash 演算法為 BLAKE2s)*
 
 ---
 
@@ -222,11 +233,11 @@ Noise `NK` 第二條訊息的序列化：
 
 | 錯誤情境 (Error Scenario) | 所在層級 | 是否可觀測 | 協議行為 (Protocol Action) | 關閉粒度 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Handshake Length Mismatch** | Handshake | 否 | 靜默丟棄 (Silent Drop)，斷開底層或 Fallback。 | Session |
-| **Handshake AEAD / MAC Fail** | Handshake | 否 | 靜默丟棄 (Silent Drop)，斷開底層或 Fallback。 | Session |
-| **Client Auth Fail (Token 錯誤)**| Auth     | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x05)`，硬關閉。 | Session |
-| **Record Header De-obfuscate Fail** | Record | 是 (TCP RST) | 硬關閉底層連線 (Transport Close)，無錯誤幀。 | Session |
-| **Record AEAD MAC Fail / 亂序** | Record | 是 (TCP RST) | 視為流污染。硬關閉底層連線，無錯誤幀。 | Session |
+| **Handshake Length Mismatch** | Handshake | 否 | 靜默丟棄 (Silent Drop)。 | Session |
+| **Handshake AEAD / MAC Fail** | Handshake | 否 | 靜默丟棄 (Silent Drop)。 | Session |
+| **Client Auth Fail (Token 錯誤)**| Auth     | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x05)`，然後 `Abort Transport`。 | Session |
+| **Record Header De-obfuscate Fail** | Record | 是 (底層關閉) | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Session |
+| **Record AEAD MAC Fail / 亂序** | Record | 是 (底層關閉) | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Session |
 | **Channel Flow Control Overflow** | Channel | 是 (RESET Frame)| 發送 `RESET_CHANNEL (Code: 0x03)`。 | **Channel** |
 | **Unknown Frame Type** | Control | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x02)`，進入 Draining。 | Session |
-| **Session Flow Control Overflow** | Control | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x04)`，硬關閉。 | Session |
+| **Session Flow Control Overflow** | Control | 是 (GOAWAY) | 發送 `GOAWAY (Code: 0x04)`，然後 `Abort Transport`。 | Session |
