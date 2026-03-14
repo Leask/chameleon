@@ -99,6 +99,18 @@ Noise `NK` 第二條訊息的序列化：
 * `payload` (使用更新後的金鑰進行 AEAD 加密): 128 Bytes + 16 Bytes MAC = 144 Bytes
 **總長度**: `32 + 144 = 176 Bytes`。
 
+### 3.3 Epoch Cert 驗證演算法 (Epoch Cert Verification Algorithm)
+接收到伺服器的 `Epoch Cert` 後，客戶端**必須 (MUST)** 執行以下嚴格的驗證步驟。任何一步失敗，必須立即中斷連線並丟棄金鑰：
+
+1. **Signer Trust Root 校驗**: 客戶端必須預先透過控制面 (OOB) 獲取 Root CA 的 Ed25519 公鑰。使用此公鑰驗證 `Epoch Cert` 後 64 Bytes 的 `Ed25519 Control Plane Sig`。簽名的 Message 內容為 `Epoch Cert` 的前 48 Bytes (`Server Static Pubkey` || `Epoch_Window_Start` || `Epoch_Window_End`)。
+2. **Responder Key 綁定校驗**: 提取 `Epoch Cert` 中的 32 Bytes `Server Static Pubkey`，並與本次 Noise `NK` 握手前客戶端所使用的預期伺服器公鑰進行絕對比對 (恆等校驗)。若不一致，代表伺服器身份被劫持或節點串線，立即失敗。
+3. **新鮮度視窗與時鐘容忍 (Freshness Window & Clock Skew)**:
+   * 獲取客戶端目前的絕對時間 (UTC 秒數)，記為 `Now`。
+   * 定義最大時鐘偏差容忍值 `MAX_CLOCK_SKEW = 300` (秒)。
+   * **生效檢查**: `Now + MAX_CLOCK_SKEW >= Epoch_Window_Start`。若不滿足，視為憑證尚未生效 (可能時鐘嚴重落後或配置錯誤)。
+   * **過期檢查**: `Now - MAX_CLOCK_SKEW <= Epoch_Window_End`。若不滿足，視為憑證已過期 (可能遭逢重放攻擊或節點未更新)。
+   * 違反上述時間視窗時，觸發 `Config Refresh Required` 的恢復策略。
+
 ---
 
 ## 4. 記錄層規格 (Record Layer)
@@ -143,12 +155,17 @@ Noise `NK` 第二條訊息的序列化：
 +---------+----------------+----------------+------------------+-------------+
 ```
 **強制規範 (MUST)**: 握手完成後，客戶端進入 **Provisional Session (臨時會話)**。此狀態下：
-1. 第一個 Record 的第一個 Frame **必須**是 `CLIENT_AUTH`。
-2. 伺服器在收到此幀之前，**絕對禁止**處理任何 `OPEN_CHANNEL` 或 `DATA` 請求。
-3. 伺服器必須設定嚴格的 Provisional 超時時間 (如 3 秒) 與最大接收字節數 (如 1KB)。超時或越界立即 `Abort Transport`。
-* `Auth Scheme`: `0x01` (預設，使用 Ed25519 簽名綁定握手 Transcript Hash)，其他值保留。
-* `Credential ID`: 設備或使用者的唯一標識。
-* `Proof`: 基於 `Auth Scheme` 生成的授權證明。若驗證失敗，伺服器必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
+1. 第一個 Record 的第一個 Frame **必須**是 `CLIENT_AUTH`。且該 Record **絕對禁止**包含除 `PAD` 外的任何其他 Frame（不允許將 Auth 與 `OPEN_CHANNEL` 放在同一個 Record 內打包）。
+2. **硬性資源邊界 (Strict Provisional Bounds)**: 伺服器在進入 Provisional 狀態後啟動計時器與計數器。在成功驗證 `CLIENT_AUTH` 之前：
+   * **絕對超時上限 (Absolute Timeout)**: `3000` 毫秒。
+   * **最大接收位元組 (Max Inbound Bytes)**: `2048` Bytes (包含底層協議頭)。
+   任何越界行為必須立即觸發 `Abort Transport`。
+3. **驗證演算法 (Auth Scheme 0x01: Ed25519 Transcript Binding)**:
+   * `Credential ID`: 作為索引，用於在控制面下發的使用者資料庫中查找對應的 Client Ed25519 Public Key。
+   * `Proof Length`: 固定為 `64` (Bytes)。
+   * `Proof`: 客戶端使用其 Ed25519 私鑰，對**當前連線的 Noise 握手 Transcript Hash** (即 Noise 狀態機握手完成時的 `h` 變數，32 Bytes) 進行數位簽章。
+   * **安全性**: 此設計將客戶端的長期身份 (`Credential ID`) 與這一次特定的物理連線 (`Transcript Hash`) 進行密碼學綁定，徹底杜絕了 Auth Token 被跨連線重放的可能。
+4. 伺服器若驗證失敗（ID 不存在、簽名錯誤、或該 ID 已被撤銷），必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
 
 ### 5.1 通道層 Frames (Channel Lifecycle & Multiplexing)
 
