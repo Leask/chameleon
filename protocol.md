@@ -142,18 +142,25 @@ Noise `NK` 第二條訊息的序列化：
 | AEAD Ciphertext (Payload + 16 bytes MAC)         |  
 +--------------------------------------------------+
 ```
-* `Length` (2 bytes): 表示整個 Ciphertext 的總長度（**包含 16 Bytes 的 MAC Tag**）。即 `Payload Length + 16`。最大允許值 `16384` (16KB)。最小允許值 `16` (Payload 為空)。
-* `Flags` (1 byte): `[Key Phase (1 bit)] [Reserved (7 bits, 須為 0)]`。
-* **精確混淆演算法**: 我們使用 `Sample` 作為 ChaCha20 的 Nonce 輸入，確保每個 Record 的 Mask 都是動態且不可預測的。
-  1. `Sample` 擷取：取 `Ciphertext` 的前 12 Bytes。如果 `Ciphertext` 總長度大於等於 16 Bytes，直接取前 12 Bytes。如果小於 12 Bytes（協議邏輯上最小為 16，但為防禦極端惡意截斷），不足部分在末尾補 `0x00`。
-  2. `Mask` 生成：使用標準 ChaCha20 區塊加密。
-     * `Key` = `HP_Key` (32 Bytes)
-     * `Nonce` = `Sample` (12 Bytes)
-     * `Block Counter` = `0`
-     * 生成 64 Bytes 的 Keystream，截取前 3 Bytes 作為 `Mask`。
-* `Obfuscated_Header = (Length || Flags) XOR Mask`。
+* `Length` (2 bytes): 表示整個 Ciphertext 的總長度（**包含 16 Bytes 的 MAC Tag**）。即 `Payload Length + 16`。最大允許值 `16384` (16KB)。最小允許值 `16` (Payload 為空)。若超出此範圍，**必須立即 `Abort Transport`**。
+* `Flags` (1 byte): `[Key Phase (1 bit)] [Reserved (7 bits, 須為 0)]`。若保留位不為 0，視為協議違規，**必須立即 `Abort Transport`**。
+* **AEAD 附加認證資料 (AAD)**: 反混淆後獲得的 3 Bytes `Plain_Header` (`Length || Flags`) **必須 (MUST)** 作為 `AAD` 輸入到 AEAD (ChaCha20-Poly1305) 的解密/加密函數中。這確保了 `Key Phase` 和 `Length` 無法被惡意篡改。
 
-* **解析器行為 (Parser Discipline)**: 接收方先讀取 3 Bytes 的 `Obfuscated_Header`。接著向前**預讀 (Peek)** 後續的 12 Bytes 作為 `Sample`。使用 `HP_Key` 和 `Sample` 計算出 Mask 後，反解出 `Length` 與 `Flags`。最後根據 `Length` 繼續讀取完整的 Ciphertext 進行 AEAD 解密。
+* **精確混淆演算法 (發送方)**:
+  1. 構造 `Plain_Header = Length || Flags`。
+  2. 以 `AAD = Plain_Header` 執行 AEAD 加密，得到 `Ciphertext`。
+  3. `Sample` = 取 `Ciphertext` 的前 12 Bytes（不足 12 Bytes 則末尾補 0x00）。
+  4. 使用標準 ChaCha20 區塊加密產生 Mask：
+     `Key` = `HP_Key` (32 Bytes), `Nonce` = `Sample` (12 Bytes), `Block Counter` = 0。截取輸出 Keystream 的前 3 Bytes 作為 `Mask`。
+  5. `Obfuscated_Header = Plain_Header XOR Mask`。
+
+* **解析器行為 (接收方)**:
+  1. 讀取 3 Bytes 的 `Obfuscated_Header`。
+  2. 預讀 (Peek) 後續的 12 Bytes 作為 `Sample`（不足則補 0x00）。
+  3. 根據 `HP_Key` 與 `Sample` 產出 `Mask`，反解得到 `Plain_Header`。
+  4. 驗證 `Length` 與 `Flags` 合法性。
+  5. 讀取完整的 `Ciphertext`。
+  6. 以 `AAD = Plain_Header` 執行 AEAD 解密。若 MAC 校驗失敗，視為流污染，**立即 `Abort Transport`**。
 
 ---
 
@@ -170,16 +177,18 @@ Noise `NK` 第二條訊息的序列化：
 1. 第一個 Record 的第一個 Frame **必須**是 `CLIENT_AUTH`。且該 Record **絕對禁止**包含除 `PAD` 外的任何其他 Frame（不允許將 Auth 與 `OPEN_CHANNEL` 放在同一個 Record 內打包）。
 2. **硬性資源邊界 (Strict Provisional Bounds)**: 伺服器在進入 Provisional 狀態後啟動計時器與計數器。在成功驗證 `CLIENT_AUTH` 之前：
    * **絕對超時上限 (Absolute Timeout)**: `3000` 毫秒。
-   * **最大接收位元組 (Max Inbound Bytes)**: `2048` Bytes (包含底層協議頭)。
+   * **最大接收位元組 (Max Inbound Bytes)**: `2048` Bytes (**純 Chameleon 協議層位元組**，僅計算 3-Byte Header + Ciphertext Length，不包含底層 TCP/QUIC 開銷)。
    任何越界行為必須立即觸發 `Abort Transport`。
 3. **驗證演算法 (Auth Scheme 0x01: Ed25519 Transcript Binding)**:
    * `Credential ID`: 作為索引，用於在控制面下發的使用者資料庫中查找對應的 Client Ed25519 Public Key。
-   * `Proof Length`: 固定為 `64` (Bytes)。
+   * `Proof Length`: 固定為 `64` (Bytes)。全局最大允許長度為 `1024` Bytes。
    * **Domain Separation 與綁定**: 客戶端使用其 Ed25519 私鑰，對特定的 Context String 與**當前連線的 Noise 握手 Transcript Hash** 進行拼接後簽章。
      `Proof = Sign( Private_Key, "chameleon-auth-v1" || h )`
      (其中 `"chameleon-auth-v1"` 為 ASCII 編碼，不含 null，共 17 Bytes；`h` 即 Noise 狀態機握手完成時輸出的 32 Bytes Hash 變數)。
    * **安全性**: 此設計將客戶端的長期身份 (`Credential ID`) 與這一次特定的物理連線 (`Transcript Hash`) 進行了上下文隔離的密碼學綁定，徹底杜絕了 Auth Token 被跨連線、跨協議重放的可能。
-4. 伺服器若驗證失敗（ID 不存在、簽名錯誤、或該 ID 已被撤銷），必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
+4. **錯誤處置**:
+   * 若 `Auth Scheme` 不支援，伺服器必須發送 `GOAWAY (Code: 0x02 Protocol Violation)` 並硬關閉連線。
+   * 若支援但驗證失敗（ID 不存在、簽名錯誤、或該 ID 已被撤銷），伺服器必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
 
 ### 5.1 通道層 Frames (Channel Lifecycle & Multiplexing)
 
