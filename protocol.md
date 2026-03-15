@@ -318,14 +318,18 @@ Noise `NK` 第二條訊息的序列化：
 
 ## 6. 錯誤處理與恢復矩陣 (Error Handling & Recovery Matrix)
 
-| 錯誤情境 (Error Scenario) | 所在層級 | 伺服器動作 (Server Action) | 客戶端恢復策略 (Client Recovery) |
+| 錯誤情境 (Error Scenario) | 立即動作 (Immediate Action) | 重試策略 (Retry Policy) | 控制面刷新 (Config Refresh Required?) |
 | :--- | :--- | :--- | :--- |
-| **Handshake Length Mismatch** | Handshake | 靜默丟棄 (Silent Drop)。 | Retry Different Node |
-| **Handshake AEAD / MAC Fail** | Handshake | 靜默丟棄 (Silent Drop)。 | Retry Different Node |
-| **Client Auth Fail (Token 錯誤)**| Auth     | 發送 `GOAWAY (Code: 0x05)`，然後 `Abort Transport`。 | Require Config Refresh (Do Not Retry) |
-| **Record Header De-obfuscate Fail** | Record | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Retry Same Node (If transient) / Switch Node |
-| **Record AEAD MAC Fail / 亂序** | Record | 視為流污染。立即硬關閉 (`Abort Transport`)，無錯誤幀。 | Retry Same Node (If transient) / Switch Node |
-| **Channel Flow Control Overflow** | Channel | 發送 `RESET_CHANNEL (Code: 0x03)`。 | Retry Channel (App layer decision) |
-| **Unknown Frame Type** | Control | 發送 `GOAWAY (Code: 0x02)`，進入 Draining。 | Retry Same Node (Version mismatch check) |
-| **Session Flow Control Overflow** | Control | 發送 `GOAWAY (Code: 0x04)`，然後 `Abort Transport`。 | Retry Same Node (Rate limit applied) |
-| **Server Maintenance/Epoch Expiring**| Control | 發送 `GOAWAY (Code: 0x00)`，進入 Draining。 | Switch Node (Graceful shift) |
+| **Handshake Length / AEAD Fail** | 靜默丟棄 (Silent Drop) | Retry Different Node | Yes (若多節點連續失敗) |
+| **Epoch Cert Signature Invalid**| 發送 `GOAWAY (0x02)` -> Abort | Security Failure, Switch Route | **Yes (強制作為第一處置)** |
+| **Responder Key Mismatch**    | 發送 `GOAWAY (0x02)` -> Abort | Hard Security Failure, Stop Route| **Yes (強制作為第一處置)** |
+| **Epoch Cert Not Yet Valid**  | 發送 `GOAWAY (0x02)` -> Abort | Check Local Clock | No / Yes (若時鐘正常) |
+| **Epoch Cert Expired**        | 發送 `GOAWAY (0x00)` -> Drain | Retry Different Node Same Group | Yes |
+| **Capability Mismatch**       | 靜默或 `GOAWAY (0x02)` | Do Not Retry Same Caps | No |
+| **Client Auth Fail (Token 錯)**| 發送 `GOAWAY (0x05)` -> Abort | Local Bug / Config Error | **Yes (可能憑證已被撤銷)** |
+| **Unsupported Auth Scheme**   | 發送 `GOAWAY (0x02)` -> Drain | Do Not Retry | Yes (升級客戶端) |
+| **Provisional Bound Exceeded**| 立即硬關閉 (`Abort Transport`)| App Bug / Rate Limit Triggered | No |
+| **Record Header/MAC Fail**    | 視為污染 -> Abort Transport | Retry Same Node (限1次) / Switch | No (除非頻繁發生) |
+| **Channel Flow Control Over** | 發送 `RESET_CHANNEL (0x03)` | Retry Channel (App Layer) | No |
+| **Session Flow Control Over** | 發送 `GOAWAY (0x03)` -> Abort | Retry Same Node (帶退避算法) | No |
+| **Server Maintenance/ID Exhaust**| 發送 `GOAWAY (0x00)` -> Drain| Reassign New Channels to Pool | No (平滑切換) |
