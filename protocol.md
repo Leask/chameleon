@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v3.0
+# Chameleon 網路通訊協議規格書 v10.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -11,19 +11,20 @@
 Chameleon 是一個運行於可靠位元組流（Reliable Byte Stream，如 QUIC Stream、TCP、WebSocket）之上的安全隧道與多路復用協議。
 
 協議分為四層：
-1. **握手層 (Handshake Layer)**: 負責身份認證、金鑰交換與能力協商。
+1. **握手層 (Handshake Layer)**: 負責伺服器側信任建立 (Server-side Trust Establishment)、金鑰交換與能力協商。客戶端授權在握手後的 `CLIENT_AUTH` 階段完成。
 2. **記錄層 (Record Layer)**: 負責加密、嚴格防重放、定界與頭部混淆。
-3. **通道層 (Channel Layer)**: 負責多路復用、流控與生命週期管理。
-4. **控制層 (Control Layer)**: 負責會話級信令、金鑰輪換與錯誤恢復。
+3. **通道層 (Channel Layer)**: 負責在單一加密會話中多路復用多個邏輯連線。
+4. **控制層 (Control Layer)**: 負責會話級別的信令、金鑰輪換與錯誤恢復。
 
 ### 1.1 位元組序與約定
 * 所有整數欄位（16-bit, 32-bit, 64-bit）均使用**大端序 (Big-Endian, Network Byte Order)**。
 * 基礎承載假設為**無損、保序的可靠位元組流**（Reliable in-order byte stream）。
-* 密碼學金鑰與雜湊值以位元組陣列 (Byte Array) 處理。
+* 所有的密碼學金鑰與雜湊值以位元組陣列 (Byte Array) 處理。
 
 ### 1.2 密碼學標準參考 (Cryptographic Standards)
 * **ChaCha20-Poly1305**: RFC 8439
-* **Noise Protocol Framework**: RFC 7748 (Curve25519)
+* **Noise Protocol Framework**: Noise Specification (Revision 34)
+* **X25519**: RFC 7748
 * **HKDF**: RFC 5869
 
 ---
@@ -63,14 +64,13 @@ Chameleon 不直接使用 `cs1/cs2` 進行加密，而是將其作為 PRK (Pseud
 
 **1. 構造明文 Payload (64 Bytes 固定長度):**
 ```text
-+-------------------+-------------------+-----------------------------------+
-| Version (1 byte)  | Caps (4 bytes)    | Padding (59 bytes, 填 0x00)       |
-+-------------------+-------------------+-----------------------------------+
++-------------------+-------------------+-------------------+-------------------------------+
+| Version (1 byte)  | Offered Caps (4)  | Required Caps (4) | Padding (55 bytes, 填 0x00)   |
++-------------------+-------------------+-------------------+-------------------------------+
 ```
 * `Version`: 必須為 `0x01`。
-* `Caps`: 能力位元遮罩。
-  * `Bit 0`: 支援 Datagram Channel (保留)。
-  * `Bit 1-31`: 必須填 `0`。未知 Bit 必須被忽略。
+* `Offered Caps` (4 bytes): 客戶端支援的能力位元遮罩（Bit 0: Datagram，其餘保留填 0）。
+* `Required Caps` (4 bytes): 客戶端**強制要求**伺服器支援的能力位元遮罩。若伺服器無法滿足，雙方握手雖可完成，但伺服器必須隨後發送 `GOAWAY 0x02`。
 
 **2. 密文傳輸 (112 Bytes 固定長度):**
 Noise `NK` 第一條訊息的序列化：
@@ -102,7 +102,8 @@ Noise `NK` 第一條訊息的序列化：
 | Version (1 byte)  | Selected Caps (4) | Epoch Cert (120 b)| Pad (3 bytes) |
 +-------------------+-------------------+-------------------+---------------+
 ```
-* `Selected Caps`: 伺服器同意啟用的能力。**伺服器行為 (MUST)**: 此值必須是客戶端請求的 `Caps` 的子集 (Subset)。伺服器不得開啟客戶端未請求的能力。**客戶端行為**: 收到後對比，若關鍵能力未被滿足，客戶端可主動 `Abort Transport`。
+* `Selected Caps`: 伺服器同意啟用的能力。**伺服器行為 (MUST)**: 此值必須是客戶端 `Offered Caps` 的子集 (Subset)。若伺服器無法滿足 `Required Caps`，仍會返回其支援的子集。
+* **客戶端行為**: 收到後比對，若 `(Required Caps & ~Selected Caps) != 0`，代表關鍵能力未被滿足，客戶端必須主動 `Abort Transport`，並標記為 Capability Mismatch。
 
 **3. 密文傳輸 (176 Bytes 固定長度):**
 Noise `NK` 第二條訊息的序列化：
