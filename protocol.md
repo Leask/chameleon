@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v12.0
+# Chameleon 網路通訊協議規格書 v13.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -188,7 +188,7 @@ Noise `NK` 第二條訊息的序列化：
    * **握手前最大記錄數 (Max Records Before Auth)**: `2`。
    任何越界行為必須立即觸發 `Abort Transport`。
 3. **驗證演算法 (Auth Scheme 0x01: Ed25519 Transcript Binding)**:
-   * `Credential ID`: 作為索引，用於在控制面下發的使用者資料庫中查找對應的 Client Ed25519 Public Key。
+   * `Credential ID`: 作為索引，用於在控制面下發的 **Auth Realm Manifest** (客戶端憑證清單) 中查找對應的 Client Ed25519 Public Key。伺服器必須基於此全域一致的 Manifest 進行驗證，不得依賴私有資料庫。
    * `Proof Length`: 固定為 `64` (Bytes)。全局最大允許長度為 `1024` Bytes。
    * **Domain Separation 與綁定**: 客戶端使用其 Ed25519 私鑰，對特定的 Context String 與**當前連線的 Noise 握手 Transcript Hash** 進行拼接後簽章。
      `Proof = Sign( Private_Key, "chameleon-auth-v1" || h )`
