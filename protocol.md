@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v11.0
+# Chameleon 網路通訊協議規格書 v12.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -301,9 +301,9 @@ Noise `NK` 第二條訊息的序列化：
    * 接收方完成切換後，也應盡快發送自己的 `KEY_UPDATE` 幀以完成雙向輪換。
 * **安全約束**: 為避免歧義，連續兩次 `KEY_UPDATE` 的發送之間必須相隔至少 1000 個 Records 或 1 分鐘，接收方若在冷卻期內收到連續的 `KEY_UPDATE`，必須 `GOAWAY 0x02`。
 * **強制輪換觸發條件 (Mandatory Triggers)**: 當逼近以下任一門檻時，發送方必須主動發送 `KEY_UPDATE`：
-  1. `MAX_RECORDS_PER_GENERATION = 2^30`
-  2. `MAX_BYTES_PER_GENERATION = 2^40` (1 TB)
-  3. `MAX_KEY_AGE = 1` 小時
+  1. `MAX_RECORDS_PER_GENERATION = 2^30` (單一方向、單一 Generation 內的加密 Record 總數)。
+  2. `MAX_BYTES_PER_GENERATION = 2^40` (1 TB, 單一方向、單一 Generation 內的 Ciphertext 位元組總數，包含 3-Bytes Obfuscated Header 與 MAC Tag)。
+  3. `MAX_KEY_AGE = 1` 小時 (從該 Generation 的 Commit 時間點起算)。
   冷卻期不適用於強制輪換。當對端長期不 rekey 時，本端可主動發起輪換。
 
 #### `0x13` GOAWAY (會話級致命錯誤)
@@ -331,18 +331,27 @@ Noise `NK` 第二條訊息的序列化：
 
 ## 6. 錯誤處理與恢復矩陣 (Error Handling & Recovery Matrix)
 
-| 錯誤情境 (Error Scenario) | 檢測方 (Detected By) | 本地動作 (Local Action) | 對端可見信號 (Peer-Visible Signal) | 重試/刷新策略 (Retry / Refresh Policy) |
-| :--- | :--- | :--- | :--- | :--- |
-| **Handshake Length / AEAD Fail** | Server | Abort Transport / Fallback | None (Silent Drop) | Client: Retry Different Node |
-| **Epoch Cert Signature Invalid**| Client | Discard keys + Abort | None | Refresh config first |
-| **Responder Key Mismatch**    | Client | Abort Transport | None | Hard security failure, stop route |
-| **Epoch Cert Not Yet Valid**  | Client | Abort Transport | None | Check local clock |
-| **Epoch Cert Expired**        | Client | Abort Transport | None | Retry different node, refresh config |
-| **Capability Mismatch**       | Client | Abort Transport | None | Do not retry same capability set |
-| **Client Auth Fail (Token 錯)**| Server | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
-| **Unsupported Auth Scheme**   | Server | Hard Close | `GOAWAY (0x02)` | Upgrade Client |
-| **Provisional Bound Exceeded**| Server | Abort Transport | None (Pre-Auth Drop) | App Bug / Rate Limit Triggered |
-| **Record Header/MAC Fail**    | Both | Abort Transport | None | Retry Same Node (限1次) / Switch |
-| **Channel Flow Control Over** | Both | Discard Channel State | `RESET_CHANNEL (0x03)` | Retry Channel (App Layer) |
-| **Session Flow Control Over** | Both | Abort Transport | `GOAWAY (0x03)` | Retry Same Node (帶退避算法) |
-| **Server Maintenance/ID Exhaust**| Both | Wait for Drain | `GOAWAY (0x00)` | Reassign New Channels to Pool |
+錯誤處理被劃分為四種**故障分類 (Fault Category)**，以確保運營側能精確定位問題：
+* **[S] Security / Trust Failure**: 信任鏈斷裂、安全綁定失敗或金鑰失配。
+* **[C] Config / Freshness Fault**: 控制面資料失效或尚未同步。
+* **[P] Protocol / Version Mismatch**: 雙方能力或協議版本不匹配。
+* **[I] Implementation / Credential Fault**: 本地邏輯、憑證生成或資源控制錯誤。
+
+| 錯誤情境 (Error Scenario) | 檢測方 (Detected By) | 故障分類 (Category) | 本地動作 (Local Action) | 對端可見信號 (Peer-Visible Signal) | 重試/刷新策略 (Retry / Refresh Policy) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Handshake Length / AEAD Fail** | Server | [P] / [S] | Abort Transport / Fallback | None (Silent Drop) | Client: Retry Different Node |
+| **Epoch Cert Signature Invalid**| Client | [S] | Discard keys + Abort | None | Refresh control-plane config first |
+| **Responder Key Mismatch**    | Client | [S] | Abort Transport | None | Hard security failure, stop route |
+| **Epoch Cert Not Yet Valid**  | Client | [C] | Abort Transport | None | Check local clock |
+| **Epoch Cert Expired**        | Client | [C] | Abort Transport | None | Freshness lag; Retry different node, refresh config |
+| **Capability Mismatch**       | Client | [P] | Abort Transport | None | Feature mismatch; Do not retry same capability set |
+| **Client Auth Fail (Token 錯)**| Server | [I] / [C] | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
+| **Unsupported Auth Scheme**   | Server | [P] | Hard Close | `GOAWAY (0x02)` | Upgrade Client |
+| **Provisional Bound Exceeded**| Server | [I] | Abort Transport | None (Pre-Auth Drop) | App Bug / Rate Limit Triggered |
+| **Record Header/MAC Fail**    | Both | [S] | Abort Transport | None | Retry Same Node (限1次) / Switch |
+| **Channel Flow Control Over** | Both | [I] | Discard Channel State | `RESET_CHANNEL (0x03)` | Retry Channel (App Layer) |
+| **Session Flow Control Over** | Both | [I] | Abort Transport | `GOAWAY (0x03)` | Retry Same Node (帶退避算法) |
+| **Server Maintenance/ID Exhaust**| Both | [C] | Wait for Drain | `GOAWAY (0x00)` | Reassign New Channels to Pool |
+
+**關於 `Client Auth Fail` 的運營避險規則**:
+客戶端收到 `GOAWAY 0x05` 時，可以嘗試一次 Config Refresh。若連續 Refresh 後仍然發生 `0x05`，必須升級為**本地憑證已撤銷 (Revoked) 或本地實作錯誤 (Implementation Bug)**，客戶端必須停止無意義的重試並暫停控制面輪詢，避免對控制面發起雪崩式請求。

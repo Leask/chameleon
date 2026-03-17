@@ -1,4 +1,4 @@
-# Chameleon 控制面與信任分發規格 v11.0
+# Chameleon 控制面與信任分發規格 v12.0
 *(Control Plane & Out-of-Band Trust Objects Specification)*
 
 **狀態**: 草案 (Draft)
@@ -53,12 +53,25 @@ NodeEntry =
   [Optional: Next_Static_Pubkey (32 bytes)] ||
   [Optional: Next_Not_Before (8 bytes)] ||
   Endpoint_Count (1 byte) ||
-  Endpoint[0] || ... || Endpoint[N-1] ||
+  Endpoint[0] || ... || Endpoint[N-1]
+
+**結構化端點 (Structured Endpoint): `Endpoint`**
+```text
+Endpoint =
+  Transport_Class (1 byte) ||
   Priority (4 bytes) ||
   Weight (4 bytes) ||
-  Transport_Class (1 byte)
-
-*(註：Endpoint 序列化格式為 `Endpoint_Length (1 byte) || Endpoint_String (ASCII)`)*
+  Host_Type (1 byte) ||
+  Host_Length (1 byte) || Host (ASCII or Raw Bytes) ||
+  Port (2 bytes)
+```
+* **Transport_Class**: `0x01` (TCP), `0x02` (UDP), `0x03` (WebSocket). 客戶端必須嚴格依照此類型發起底層連線。
+* **Host_Type**: `0x01` (IPv4, Host 固定 4 bytes), `0x02` (IPv6, Host 固定 16 bytes), `0x03` (Domain, Host 為 ASCII 字串)。
+* **調度語義 (Scheduling Semantics)**:
+  1. 客戶端在同一個 `Route_Group_ID` 內收集所有可用的 `Endpoint`。
+  2. **Priority**: 數值越小優先級越高。客戶端必須優先嘗試最小 Priority 的 Endpoint 集合。
+  3. **Weight**: 在相同 Priority 的 Endpoint 集合內，客戶端必須根據 Weight 執行加權隨機選擇 (Weighted-Random Selection)。
+  4. 失敗轉移：若某 Endpoint 連線失敗，優先在同 Priority 集合內重試其他 Endpoint；若該集合全數耗盡，才升級到下一個 Priority 集合。
 ```
 
 **規範化被簽體 (Canonical Body): `NodeManifestBody`**
@@ -82,13 +95,16 @@ NodeManifestBody =
 ## 3. 防回滾與更新語義 (Anti-Rollback & Updates)
 
 1. **Manifest Sequence 檢查**: 客戶端本地持久化存儲已接受的最高 `Manifest_Sequence`。如果接收到新的 Manifest，其 Sequence 小於或等於本地存儲的值，必須拒絕更新（防止攻擊者重放舊的合法配置以利用已洩漏的歷史金鑰）。
+   * **命名空間與輪換語義 (MUST)**: `Manifest_Sequence` 是在**整個控制面命名空間內全域單調遞增**的數值。即使控制面發生 `CPSK` 輪換 (Signer Rotation)，新 CPSK 簽發的 Manifest 也**絕對不可**重置 Sequence。客戶端必須跨 Signer 執行嚴格的 Anti-Rollback 校驗。
 2. **平滑金鑰輪換算法 (Deterministic Key Rollover)**:
    對同一個 `Node ID`，客戶端在發起新連線 (Session) 時，**必須**使用以下確定性算法選擇 Noise `NK` 的預期公鑰 (`Expected_Server_Pubkey`)：
    * 若 `Now < Next_Not_Before` (或不存在 Next Key)：只能使用 `Current_Static_Pubkey`。
    * 若 `Next_Not_Before <= Now < Current_Not_After` (重疊視窗 Overlap Window)：
      * 第一次嘗試必須使用 `Current_Static_Pubkey`。
-     * **僅當**該次嘗試以 `Handshake Timeout / Handshake AEAD Fail / Silent Drop` 結束，且此 `Node ID` 有 `Next_Static_Pubkey` 時，允許**一次** `Current -> Next` 的 fallback。
-     * **硬性規則**：同一輪撥號最多允許一次切換。Fallback 後若仍失敗，絕對禁止在 Current / Next 之間往返抖動。只有在 overlap window 內才允許此特殊 fallback。
+     * **僅當**該次嘗試在**單一 Endpoint 上**以 `Handshake Timeout / Handshake AEAD Fail / Silent Drop` 結束，且此 `Node ID` 明確宣告了 `Next_Static_Pubkey` 時，允許**一次** `Current -> Next` 的 fallback。
+     * **抗噪聲規則 (Noise Resistance)**: 
+       1. 若客戶端在同一個 Route Group 的多個 Node ID 上同時觀察到 Timeout，應優先視為網路路由異常或遭封鎖，而不是 Key Rollover。
+       2. Fallback 後，客戶端必須在本地暫存此決策 (Cache decision)，確保該 Node ID 短時間內不再於 Current / Next 之間反覆抖動。同一輪撥號最多允許一次切換。只有在 Overlap Window 內才允許此特殊 Fallback。
    * 若 `Now >= Current_Not_After`：只能使用 `Next_Static_Pubkey`。
    * **硬性安全約束**: 若伺服器回傳的 `Epoch Cert` 中的公鑰既不等於客戶端選定的 `Current`，也不等於 `Next`，客戶端必須視為配置失配/遭劫持，立即中斷，不得默默接受。
 3. **撤銷語義 (Revocation)**:
