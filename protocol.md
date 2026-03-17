@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v10.0
+# Chameleon 網路通訊協議規格書 v11.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -70,7 +70,7 @@ Chameleon 不直接使用 `cs1/cs2` 進行加密，而是將其作為 PRK (Pseud
 ```
 * `Version`: 必須為 `0x01`。
 * `Offered Caps` (4 bytes): 客戶端支援的能力位元遮罩（Bit 0: Datagram，其餘保留填 0）。
-* `Required Caps` (4 bytes): 客戶端**強制要求**伺服器支援的能力位元遮罩。若伺服器無法滿足，雙方握手雖可完成，但伺服器必須隨後發送 `GOAWAY 0x02`。
+* `Required Caps` (4 bytes): 客戶端**強制要求**伺服器支援的能力位元遮罩。伺服器若無法滿足，**不會主動發送錯誤**，只會在回應中返回其實際支援的 `Selected Caps`。客戶端負責進行本地比對與中斷。
 
 **2. 密文傳輸 (112 Bytes 固定長度):**
 Noise `NK` 第一條訊息的序列化：
@@ -85,15 +85,21 @@ Noise `NK` 第一條訊息的序列化：
 **Noise Transcript (Responder -> Initiator)**: `<- e, ee`
 
 **1. 紀元憑證 (Epoch Cert) 結構 (120 Bytes):**
+
+為了與控制面的防回滾機制對齊，`Epoch Cert` 的簽章必須基於嚴格的 `EpochCertSigMessage`。
+
 ```text
-+-----------------------------------+-----------------------------------+
-| Server Static Pubkey (32 bytes)   | Epoch_Window_Start (8 bytes, 秒數)|
-+-----------------------------------+-----------------------------------+
-| Epoch_Window_End (8 bytes, 秒數)  | Signer Key ID (8 bytes)           |
-+-----------------------------------+-----------------------------------+
-| Ed25519 Control Plane Sig (64 b)                                      |
-+-----------------------------------+-----------------------------------+
+EpochCertBody = 
+    Server Static Pubkey (32 bytes) || 
+    Epoch_Window_Start (8 bytes, 秒數) || 
+    Epoch_Window_End (8 bytes, 秒數) || 
+    Signer Key ID (8 bytes)
+
+EpochCertSigMessage =
+    "chameleon-epoch-cert-v1" || EpochCertBody
 ```
+
+* **線上二進位佈局**: `EpochCertBody` (56 Bytes) || `Ed25519 Control Plane Sig` (64 Bytes)。
 *(提供防重放的時間新鮮度視窗與兩級信任鏈綁定)*
 
 **2. 構造明文 Payload (128 Bytes 固定長度):**
@@ -103,7 +109,7 @@ Noise `NK` 第一條訊息的序列化：
 +-------------------+-------------------+-------------------+---------------+
 ```
 * `Selected Caps`: 伺服器同意啟用的能力。**伺服器行為 (MUST)**: 此值必須是客戶端 `Offered Caps` 的子集 (Subset)。若伺服器無法滿足 `Required Caps`，仍會返回其支援的子集。
-* **客戶端行為**: 收到後比對，若 `(Required Caps & ~Selected Caps) != 0`，代表關鍵能力未被滿足，客戶端必須主動 `Abort Transport`，並標記為 Capability Mismatch。
+* **客戶端行為**: 收到後比對，若 `(Required Caps & ~Selected Caps) != 0`，代表關鍵能力未被滿足，客戶端必須主動 `Abort Transport`，並標記為 Capability Mismatch。此檢查與中斷行為由**客戶端全權負責**，伺服器不再發出任何協議層級的錯誤信號。
 
 **3. 密文傳輸 (176 Bytes 固定長度):**
 Noise `NK` 第二條訊息的序列化：
@@ -115,7 +121,7 @@ Noise `NK` 第二條訊息的序列化：
 ### 3.3 Epoch Cert 驗證演算法 (Epoch Cert Verification Algorithm)
 接收到伺服器的 `Epoch Cert` 後，客戶端**必須 (MUST)** 執行以下嚴格的驗證步驟。任何一步失敗，必須立即中斷連線並丟棄金鑰：
 
-1. **Signer Trust Root 校驗 (兩級 PKI)**: 客戶端必須預先透過 OOB 獲取由離線 Root CA 簽發的線上控制面簽發金鑰 (`CPSK`, Control Plane Signing Key) 憑證。客戶端提取 `Epoch Cert` 中的 `Signer Key ID`，從本地信任庫中找出對應的有效 `CPSK` 公鑰。使用此 `CPSK` 公鑰驗證 `Epoch Cert` 後 64 Bytes 的 `Ed25519 Control Plane Sig`。簽名的 Message 內容為 `Epoch Cert` 的前 56 Bytes (`Server Static Pubkey` || `Epoch_Window_Start` || `Epoch_Window_End` || `Signer Key ID`)。
+1. **Signer Trust Root 校驗 (兩級 PKI)**: 客戶端必須預先透過 OOB 獲取由離線 Root CA 簽發的線上控制面簽發金鑰 (`CPSK`, Control Plane Signing Key) 憑證。客戶端提取 `Epoch Cert` 中的 `Signer Key ID`，從本地信任庫中找出對應的有效 `CPSK` 公鑰。使用此 `CPSK` 公鑰驗證 `Epoch Cert` 後 64 Bytes 的 `Ed25519 Control Plane Sig`。簽名的 Message 內容必須為前述定義的 `EpochCertSigMessage`。
 2. **Responder Key 綁定校驗**: 提取 `Epoch Cert` 中的 32 Bytes `Server Static Pubkey`，並與本次 Noise `NK` 握手前客戶端所使用的預期伺服器公鑰進行絕對比對 (恆等校驗)。若不一致，代表伺服器身份被劫持或節點串線，立即失敗。
 3. **新鮮度視窗與時鐘容忍 (Freshness Window & Clock Skew)**:
    * 獲取客戶端目前的絕對時間 (UTC 秒數)，記為 `Now`。
@@ -179,6 +185,7 @@ Noise `NK` 第二條訊息的序列化：
 2. **硬性資源邊界 (Strict Provisional Bounds)**: 伺服器在進入 Provisional 狀態後啟動計時器與計數器。在成功驗證 `CLIENT_AUTH` 之前：
    * **絕對超時上限 (Absolute Timeout)**: `3000` 毫秒。
    * **最大接收位元組 (Max Inbound Bytes)**: `2048` Bytes (**純 Chameleon 協議層位元組**，僅計算 3-Byte Header + Ciphertext Length，不包含底層 TCP/QUIC 開銷)。
+   * **握手前最大記錄數 (Max Records Before Auth)**: `2`。
    任何越界行為必須立即觸發 `Abort Transport`。
 3. **驗證演算法 (Auth Scheme 0x01: Ed25519 Transcript Binding)**:
    * `Credential ID`: 作為索引，用於在控制面下發的使用者資料庫中查找對應的 Client Ed25519 Public Key。
@@ -293,6 +300,11 @@ Noise `NK` 第二條訊息的序列化：
      * 若解密成功，將 `current_generation` 加 1，`current_key_phase` 翻轉，並將舊 generation 的金鑰徹底銷毀。
    * 接收方完成切換後，也應盡快發送自己的 `KEY_UPDATE` 幀以完成雙向輪換。
 * **安全約束**: 為避免歧義，連續兩次 `KEY_UPDATE` 的發送之間必須相隔至少 1000 個 Records 或 1 分鐘，接收方若在冷卻期內收到連續的 `KEY_UPDATE`，必須 `GOAWAY 0x02`。
+* **強制輪換觸發條件 (Mandatory Triggers)**: 當逼近以下任一門檻時，發送方必須主動發送 `KEY_UPDATE`：
+  1. `MAX_RECORDS_PER_GENERATION = 2^30`
+  2. `MAX_BYTES_PER_GENERATION = 2^40` (1 TB)
+  3. `MAX_KEY_AGE = 1` 小時
+  冷卻期不適用於強制輪換。當對端長期不 rekey 時，本端可主動發起輪換。
 
 #### `0x13` GOAWAY (會話級致命錯誤)
 ```text
@@ -319,18 +331,18 @@ Noise `NK` 第二條訊息的序列化：
 
 ## 6. 錯誤處理與恢復矩陣 (Error Handling & Recovery Matrix)
 
-| 錯誤情境 (Error Scenario) | 立即動作 (Immediate Action) | 重試策略 (Retry Policy) | 控制面刷新 (Config Refresh Required?) |
-| :--- | :--- | :--- | :--- |
-| **Handshake Length / AEAD Fail** | 靜默丟棄 (Silent Drop) | Retry Different Node | Yes (若多節點連續失敗) |
-| **Epoch Cert Signature Invalid**| 發送 `GOAWAY (0x02)` -> Abort | Security Failure, Switch Route | **Yes (強制作為第一處置)** |
-| **Responder Key Mismatch**    | 發送 `GOAWAY (0x02)` -> Abort | Hard Security Failure, Stop Route| **Yes (強制作為第一處置)** |
-| **Epoch Cert Not Yet Valid**  | 發送 `GOAWAY (0x02)` -> Abort | Check Local Clock | No / Yes (若時鐘正常) |
-| **Epoch Cert Expired**        | 發送 `GOAWAY (0x00)` -> Drain | Retry Different Node Same Group | Yes |
-| **Capability Mismatch**       | 靜默或 `GOAWAY (0x02)` | Do Not Retry Same Caps | No |
-| **Client Auth Fail (Token 錯)**| 發送 `GOAWAY (0x05)` -> Abort | Local Bug / Config Error | **Yes (可能憑證已被撤銷)** |
-| **Unsupported Auth Scheme**   | 發送 `GOAWAY (0x02)` -> Drain | Do Not Retry | Yes (升級客戶端) |
-| **Provisional Bound Exceeded**| 立即硬關閉 (`Abort Transport`)| App Bug / Rate Limit Triggered | No |
-| **Record Header/MAC Fail**    | 視為污染 -> Abort Transport | Retry Same Node (限1次) / Switch | No (除非頻繁發生) |
-| **Channel Flow Control Over** | 發送 `RESET_CHANNEL (0x03)` | Retry Channel (App Layer) | No |
-| **Session Flow Control Over** | 發送 `GOAWAY (0x03)` -> Abort | Retry Same Node (帶退避算法) | No |
-| **Server Maintenance/ID Exhaust**| 發送 `GOAWAY (0x00)` -> Drain| Reassign New Channels to Pool | No (平滑切換) |
+| 錯誤情境 (Error Scenario) | 檢測方 (Detected By) | 本地動作 (Local Action) | 對端可見信號 (Peer-Visible Signal) | 重試/刷新策略 (Retry / Refresh Policy) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Handshake Length / AEAD Fail** | Server | Abort Transport / Fallback | None (Silent Drop) | Client: Retry Different Node |
+| **Epoch Cert Signature Invalid**| Client | Discard keys + Abort | None | Refresh config first |
+| **Responder Key Mismatch**    | Client | Abort Transport | None | Hard security failure, stop route |
+| **Epoch Cert Not Yet Valid**  | Client | Abort Transport | None | Check local clock |
+| **Epoch Cert Expired**        | Client | Abort Transport | None | Retry different node, refresh config |
+| **Capability Mismatch**       | Client | Abort Transport | None | Do not retry same capability set |
+| **Client Auth Fail (Token 錯)**| Server | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
+| **Unsupported Auth Scheme**   | Server | Hard Close | `GOAWAY (0x02)` | Upgrade Client |
+| **Provisional Bound Exceeded**| Server | Abort Transport | None (Pre-Auth Drop) | App Bug / Rate Limit Triggered |
+| **Record Header/MAC Fail**    | Both | Abort Transport | None | Retry Same Node (限1次) / Switch |
+| **Channel Flow Control Over** | Both | Discard Channel State | `RESET_CHANNEL (0x03)` | Retry Channel (App Layer) |
+| **Session Flow Control Over** | Both | Abort Transport | `GOAWAY (0x03)` | Retry Same Node (帶退避算法) |
+| **Server Maintenance/ID Exhaust**| Both | Wait for Drain | `GOAWAY (0x00)` | Reassign New Channels to Pool |
