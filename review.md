@@ -1,358 +1,331 @@
 # Chameleon Review
-## 對 `design.md` v11.0、`protocol.md` v11.0 與 `control_plane.md` v11.0 的新一輪聯合審查
+## 對 `design.md` v12.0、`protocol.md` v12.0 與 `control_plane.md` v12.0 的新一輪聯合審查
 
-這一輪和上一輪相比，真正值得肯定的是：你們已經把前一輪最重要的幾個阻塞點
-真正做成了規格，而不只是寫了更好聽的描述。這包括：
+這一輪和上一輪相比，最大的變化不是又多了幾段辯護，而是你們真的把幾個
+會導致實作分叉的硬問題往前推了一大步。
 
-1. `Node Manifest` 已經把 route metadata 簽進 canonical body
-2. `Deterministic Key Rollover` 不再依賴明顯錯誤的 `Responder Key Mismatch` 觸發條件
-3. `Capability Mismatch` 已基本收斂到 client-local abort
-4. `Recovery Matrix` 已開始變成 actor-aware 結構
-5. `Epoch Cert` 已對齊到 context-separated signature message
-6. `KEY_UPDATE` 和 provisional session 都開始有硬性上限
+真正可以正式承認的進展有：
 
-這些都不是小修小補，而是把規格從「大致可說通」拉到了「開始接近真正可互通」。
+1. `Endpoint` 已從字串提升為結構化二進位
+2. `Priority / Weight` 的調度語義已經首次被寫成明確規則
+3. `Manifest_Sequence` 的命名空間與 CPSK 輪換語義已被明示
+4. `Current -> Next` rollover fallback 已加入單一 endpoint 約束與本地決策快取
+5. `KEY_UPDATE` 的 bytes / age 計數語義已被明確化
+6. `Recovery Matrix` 已正式引入 fault category
+7. `GOAWAY 0x05` 後的客戶端避險策略已不再是完全空白
 
-但也正因為如此，這一輪的剩餘問題會更偏向最後一公里：
-不是大方向錯，而是幾個語義還不夠精確，足以讓不同實作做出不同決策。
+所以這一輪 review 的重點，不再是追著舊漏洞重複攻擊，而是要指出：
+你們解掉了上一批歧義後，新的規格邊界在哪裡又露出了裂縫。
 
 ---
 
 ## 0. 本輪可以正式關閉的舊問題
 
-### 0.1 `Node Manifest` 已不再缺路由元資料
-上一輪最大的控制面問題是：route metadata 沒有被正式簽進 canonical body。
-這一輪 `control_plane.md` 已把 `Endpoint / Priority / Weight / Transport_Class`
-納入 `NodeEntry`，這個批評可以正式關閉。
+### 0.1 `Endpoint_String` 的解析歧義已經基本關閉
+上一輪我對 `Endpoint_String` 的主要攻擊是 grammar、正規化和多 endpoint /
+node-level metadata 的關係。這一輪把 endpoint 提升成結構化二進位後，
+「字串該怎麼解讀」這個舊問題可以正式降級。
 
-### 0.2 `Capability Mismatch` 的大方向已經對了
-`protocol.md` 現在已經明確寫出：server 只回 `Selected Caps`，client 本地比對後 abort。
-這比上一輪三套語義併存進步很多。
+### 0.2 `Manifest_Sequence` 的命名空間歧義已經被正面回答
+你們現在明確寫出 `Manifest_Sequence` 是跨 signer 的全域單調遞增值。這至少讓
+client 的 anti-rollback 持久化策略不再需要靠猜。
 
-### 0.3 `Recovery Matrix` 已不再完全混淆 actor
-它仍然有可挑的地方，但至少表頭與主體意識已經開始成形，不再是上一輪那種
-完全把 client-local 驗證失敗和 server 可見動作混成一鍋的狀態。
+### 0.3 `KEY_UPDATE` 的強制門檻不再是示意值
+`MAX_RECORDS_PER_GENERATION`、`MAX_BYTES_PER_GENERATION`、`MAX_KEY_AGE`
+現在都已經被精確到足以避免不同實作在 rekey 時機上悄悄漂移。
 
-### 0.4 `Epoch Cert` 已對齊到獨立簽名訊息模型
-`EpochCertSigMessage` 現在已經被明確寫進 `protocol.md`。這個問題不再是主阻塞。
+### 0.4 `Recovery Matrix` 已經不再只是 actor-aware，而是開始可運營
+fault category 的加入是正確方向。雖然還沒完全細到理想狀態，但已不再是之前那種
+只給一個籠統恢復建議的草稿水平。
 
 ---
 
 ## 1. 阻塞級問題
 
-## 1.1 路由元資料雖然已經被簽進 `Node Manifest`，但其**語義**仍然沒有被規範化，客戶端仍然可能合法地做出不同選擇
+## 1.1 `Structured Endpoint` 解掉了舊的字串問題，卻把「控制面 endpoint 類型」和「資料面底層承載模型」直接撞在一起了
 
 ### 攻擊
-這一輪你們解決的是「這些欄位有沒有被簽」，但還沒有完全解決「這些欄位到底怎麼用」。
-目前最明顯的三個未定義語義是：
+`protocol.md` 仍然明確要求 Chameleon 運行在**可靠、有序的位元組流**之上，
+例子寫的是 `QUIC Stream / TCP / WebSocket`。
 
-1. `Endpoint_String` 的語法與正規化規則
-2. `Transport_Class` 的枚舉值與它和 endpoint scheme 的關係
-3. `Priority / Weight` 的實際調度語義
+但 `control_plane.md` 現在給出的 `Transport_Class` 是：
 
-現在的 `NodeEntry` 雖然簽了 route metadata，但 client 仍然不知道：
+1. `0x01` TCP
+2. `0x02` UDP
+3. `0x03` WebSocket
 
-1. `Priority` 是不是數值越小越優先
-2. `Weight` 是在同 priority 內做 weighted-random，還是只做 tie-break
-3. `Transport_Class` 是一個硬性約束、偏好標記，還是與 endpoint scheme 重複
-4. `tcp://host:443` 和 `Transport_Class = 0x02` 若互相矛盾，哪個欄位優先
-5. 一個 `NodeEntry` 內若有多個 `Endpoint`，但只有一組 `Priority / Weight /
-   Transport_Class`，那麼這些 metadata 到底是作用於整個 node，還是作用於每個
-   endpoint 的候選集合
+這三個值放在一起，語義其實是衝突的：
 
-這些語義不收斂，最終結果就是：簽名保護了資料，但沒有保護「客戶端會如何解讀資料」。
+1. `UDP` 本身不是可靠、有序的位元組流，無法直接承載目前的資料面協議
+2. `WebSocket` 不是只有 `Host + Port` 就能撥號，還需要至少 `Path`，
+   很多部署還會依賴 `TLS Mode / SNI / ALPN / Host Header`
+3. 若 `UDP` 其實想表示的是 `QUIC`，那麼欄位命名就錯了，因為 `UDP` 和
+   `QUIC Stream` 不是同一層東西
+
+更糟的是，`Endpoint` 現在仍然包含一個通用的 `Host_Length`，但同時又說
+`IPv4` / `IPv6` 的 Host 是固定 4/16 bytes。這會讓不同實作出現兩種合法分支：
+
+1. 有人按照 `Host_Type` 直接讀固定 4/16 bytes，忽略 `Host_Length`
+2. 有人嚴格按 `Host_Length` 讀，然後把 `Host_Type` 只當驗證欄位
+
+這不是文檔措辭問題，而是 wire object 還沒有完全收口。
 
 ### 為什麼目前還不夠
-Chameleon 的設計目標不是只保證 parser 互通，而是希望不同團隊盲寫也能得到
-可預期的行為。如果 route metadata 的使用語義不固定，那麼：
+這一版最大的問題不是 endpoint 不結構化，而是 endpoint 的結構仍然沒有和
+資料面假設對齊。
 
-1. 同一份 manifest 在不同客戶端上會導致不同的節點選擇
-2. route_group 的故障切換時機與順序會漂移
-3. A/B 測試、性能調優和事故定位都會變得不可重現
-4. 多 endpoint 的 `NodeEntry` 會因為「先選 node 還是先選 endpoint」的差異而產生
-   額外分叉
+現在的控制面物件同時混了三件事：
+
+1. 底層網路傳輸族類
+2. 具體撥號所需參數
+3. 資料面協議對承載的能力要求
+
+如果這三件事不分開，你們最後會遇到兩種壞結果：
+
+1. control plane 下發一個 client 根本無法正確撥號的 endpoint
+2. 不同 client 對同一個 endpoint 做不同的 transport interpretation
 
 ### 具體修改方案
-下一輪應至少把下面這些規則寫死：
+這一塊我建議不要再用現在的 `Transport_Class` 硬撐，直接重構成二層：
 
-1. `Endpoint_String` 的 grammar
-   - 若保留 ASCII 字串，就要明確定義 scheme、host 格式、port、IPv6 表示法
-   - 更好的做法是改成結構化 endpoint：
-     `Transport_Kind || Host_Type || Host || Port`
-2. `Transport_Class` 的枚舉表
-   - 每個值代表什麼
-   - 它是 hard constraint 還是 soft preference
-   - 與 endpoint scheme 發生衝突時，誰優先
-3. `Priority / Weight` 的調度算法
-   - 例如：先選最小 `Priority`
-   - 在同 priority 集合內按 `Weight` 做 weighted-random
-   - 失敗時是否在同 priority 內重試，還是升到下一個 priority bucket
-4. `Endpoint[]` 與 node-level metadata 的關係
-   - 若 `Priority / Weight / Transport_Class` 是 node-level，則必須明確規定同一
-     `NodeEntry` 內所有 `Endpoint` 都是同一 transport class 下的等價入口
-   - 若不是，則這三個欄位就不應放在 `NodeEntry`，而應移入每個 `Endpoint`
-     條目內部
+1. `Bearer_Type`
+   - 例如：`0x01 TCP_STREAM`
+   - `0x02 QUIC_STREAM`
+   - `0x03 WS_STREAM`
+2. `Bearer_Params`
+   - `TCP_STREAM`: `Host_Type || Host || Port`
+   - `QUIC_STREAM`: `Host_Type || Host || Port || ALPN || SNI_Mode`
+   - `WS_STREAM`: `Host_Type || Host || Port || Path || TLS_Mode || Host_Header`
 
-這一項如果不補，控制面雖然“有了”，但還不算真正可操作。
+如果短期內不想引入變長參數區，至少先把下面幾條寫死：
+
+1. `UDP` 改名為 `QUIC`，或明確禁止把它解讀成 raw UDP
+2. `WebSocket` endpoint 必須補 `Path`
+3. 若 `Host_Type = IPv4/IPv6`，則 `Host_Length` 必須分別固定為 `4/16`，
+   否則整個 `Node Manifest` 驗證失敗
+
+這一項如果不改，v12.0 雖然看起來更結構化了，但控制面和資料面仍然沒有真正對齊。
 
 ---
 
-## 1.2 `Deterministic Key Rollover` 已經接近可用，但現在的 fallback trigger 仍然過寬，會把普通網路噪聲誤判成 key rollover 事件
+## 1.2 `CLIENT_AUTH` 仍然不是一個完整閉環規格，因為控制面根本還沒有定義 client credential object
 
 ### 攻擊
-這一輪最大的正面修正之一，是把 rollover 的 fallback trigger 改成了
-`Handshake Timeout / Handshake AEAD Fail / Silent Drop`，這比上一輪正確得多。
+`protocol.md` 現在對 `Auth Scheme 0x01` 的簽章算法已經比前幾輪完整很多，
+但它仍然假設了一個不存在的前提：
 
-但新的問題是：這個 trigger 現在又太寬了。
+伺服器可以根據 `Credential ID` 去「控制面下發的使用者資料庫」查出對應的
+Client Ed25519 Public Key。
 
-在真實網路裡，timeout / silent drop 並不只來自 key rollover，也可能來自：
+問題是：在 `control_plane.md` 中，這個物件根本不存在。
 
-1. 短時丟包或抖動
-2. 單一路由上的瞬時黑洞
-3. 某個 endpoint 的暫時不可達
-4. 一次性的中間網路異常
+現在控制面只有：
 
-如果 client 只要在 overlap window 內遇到一次 timeout，就立即做 `Current -> Next`
-fallback，那它很可能不是在應對 key rollover，而是在對普通網路噪聲做錯誤解讀。
+1. `CPSK Certificate`
+2. `Node Manifest`
+
+但沒有任何一份規格定義：
+
+1. `Credential ID` 如何生成，是否全域唯一
+2. Credential 與 `Auth Scheme` 如何綁定
+3. Client public key 如何分發到 edge / verifier
+4. 撤銷、過期、快取 TTL、版本更新如何做
+5. 多租戶或多 auth realm 如何隔離
+
+所以目前的 `CLIENT_AUTH` 雖然在 wire format 上已經像回事了，但整體系統仍然缺一塊
+控制面基礎設施規格。
 
 ### 為什麼目前還不夠
-你們現在已經加了「同一輪撥號最多切換一次」這條硬規則，這是對的。
-但這還不足以保證 fallback 真的是“因為 key 切換”，而不是“因為碰巧這次網路很差”。
+如果 control plane 不定義 credential object，那麼不同實作會自己補出不同模型：
 
-在高噪聲網路下，這會帶來兩個後果：
+1. 有人用靜態本地檔案查 `Credential ID`
+2. 有人把它放進某個外部資料庫
+3. 有人把 `Credential ID` 當作公鑰雜湊
+4. 有人把撤銷當刪除，有人當 denylist
 
-1. client 會過早切到 `Next`，把純網路失敗誤標成 key rollover 事件
-2. 控制面與運營側會看到被污染的失敗分類與時序
+最後的結果是：
+
+1. `Auth Scheme 0x01` 看起來可驗證，但其實無法跨實作互通
+2. recovery matrix 中的 `0x05` 也無法對應到穩定的控制面語義
 
 ### 具體修改方案
-建議把 fallback trigger 再收窄一層，不要只依賴結果類型，還要加入上下文條件：
+下一輪至少要新增一個正式控制面物件，例如：
 
-1. 只有在 overlap window 內才允許 `Current -> Next` fallback
-2. 只有當該 `Node ID` 明確宣告了 `Next_Static_Pubkey` 才允許 fallback
-3. 只有在同一 endpoint 上出現一次 pre-auth 失敗後，才允許對同一 `Node ID`
-   做一次 `Current -> Next` 重試
-4. fallback 之後應在本地短時間 cache 此決策，避免同一個 node 在短時間內反覆
-   current/next 交替
-5. 若 client 在同 route_group 的多個節點上同時觀察到同類 timeout，應優先視為
-   route 問題，而不是 key rollover
+1. `ClientCredentialRecord`
+   - `Credential_ID`
+   - `Auth_Scheme`
+   - `Client_Public_Key`
+   - `Not_Before / Not_After`
+   - `Status` (`active / revoked / suspended`)
+   - `Realm_ID`
+2. 或者新增一份 `Auth Realm Manifest`
+   - 由控制面簽章
+   - 可被 edge/verifier 快取
+   - 定義撤銷與刷新語義
 
-更直接一點說：
-你們現在已經把「錯誤的信號」改成了「可工作的信號」，下一步要做的是把它改成
-「不容易誤觸發的信號」。
+同時 `protocol.md` 也要配套補一句：
+
+1. `Credential ID` 不是自由格式欄位，而是由控制面物件唯一綁定
+2. `GOAWAY 0x05` 的 verifier 必須基於該控制面物件，而不是某個實作私有資料庫
+
+這一項不補，`CLIENT_AUTH` 仍然只是“局部精確”，不是端到端精確。
 
 ---
 
-## 1.3 `Recovery Matrix` 雖然已經開始 actor-aware，但仍然缺少一層“錯誤分類粒度”，尤其是 auth / config / implementation fault 仍然混在一起
+## 1.3 `Manifest_Sequence` 的語義雖然終於清楚了，但你們現在把一個非常重的控制面可用性前提直接寫進規格，卻沒有定義它怎麼成立
 
 ### 攻擊
-這一輪 `Recovery Matrix` 的表頭已經比前幾輪成熟很多，但它仍然有一個殘留問題：
-它把幾類本質不同的錯誤，仍然壓成了同一個 bucket。
+上一輪我打的是 sequence 命名空間不清楚。這一輪你們選了一個非常明確的答案：
+全域單調遞增，跨 CPSK 也不能重置。
 
-最典型的是：
+這個答案本身在安全性上是合理的，但它現在引入了一個新的、而且很重的前提：
 
-1. `Client Auth Fail (Token 錯)`
-2. `Unsupported Auth Scheme`
-3. `Epoch Cert Signature Invalid`
-4. `Epoch Cert Expired`
+整個控制面必須有能力在所有 signer / region / failover 節點之間，維持單一的、
+絕不回退的 global sequence order。
 
-這些錯誤雖然都與 auth / trust 有關，但實際上對應的是四種不同來源：
+這不是免費的。
 
-1. 本地憑證或授權材料問題
-2. client / server 版本能力不匹配
-3. 信任鏈或控制面資料失效
-4. 普通時效性問題
+如果你們未來有：
 
-如果這些分類不更細，client 最終還是會把一部分本地 bug 誤當作需要 refresh config，
-把一部分需要 refresh config 的情況誤當作一般重試。
+1. 多區域控制面
+2. 災難切換
+3. signer rotation
+4. 短時間 split-brain
 
-### 為什麼目前還不夠
-現在的矩陣已經分出了 `Detected By / Local Action / Peer-Visible Signal`，這是對的。
-但要讓恢復策略真正可運營，還要再加一層：
-
-1. 這是 **local configuration fault**
-2. 這是 **control-plane freshness fault**
-3. 這是 **protocol/version mismatch**
-4. 這是 **security failure**
-
-沒有這層分類，client 最後還是很難決定到底應該：
-
-1. 立刻 refresh config
-2. 停止重試
-3. 只做退避後重試
-4. 提示升級客戶端
-
-### 具體修改方案
-不一定要新增新表，但至少要把這一層明確加進現有矩陣或錯誤碼附註：
-
-1. `Client Auth Fail`
-   - 區分：credential revoked / credential unknown / proof invalid
-2. `Unsupported Auth Scheme`
-   - 明確標成 protocol-version / feature mismatch，不屬於 config refresh
-3. `Epoch Cert Signature Invalid`
-   - 明確標成 trust-chain or control-plane freshness failure
-4. `Epoch Cert Expired`
-   - 明確標成 freshness / rollout lag，而不是 generic auth fail
-
-如果短期內不想新增錯誤碼，至少要把現有錯誤在文檔中映射到更細的本地處置分類。
-
----
-
-## 1.4 `Manifest_Sequence` 的防回滾語義仍然缺少命名空間定義，到了 CPSK 輪換時很容易把合法更新錯判為 rollback
-
-### 攻擊
-`control_plane.md` 現在要求客戶端持久化「已接受的最高 `Manifest_Sequence`」，這個方向
-本身是對的，但它還缺一個非常關鍵的限定：
-
-這個 sequence 到底是：
-
-1. 全域單調遞增
-2. 針對某個 manifest lineage 單調遞增
-3. 針對某個 `Signer_Key_ID` 單調遞增
-
-這不是文書細節，而是會直接影響 CPSK 輪換後客戶端還能不能接受新 manifest。
-
-如果未來控制面更換了新的 `CPSK`，而新簽發端從較小的 sequence 重新開始，按照目前規則，
-client 會把它視為 rollback 並永久拒絕。反過來說，如果 sequence 其實只要求對單一
-`Signer_Key_ID` 單調，那麼跨 signer 的 anti-rollback 力度又會被削弱。
+那麼「全域單調遞增」就不再只是邏輯要求，而是要求你們擁有某種全域序號分配機制。
 
 ### 為什麼目前還不夠
-現在文檔把 `Manifest_Sequence` 和 `Signer_Key_ID` 都放進了 body，但沒有定義它們之間的
-命名空間關係。這會讓不同實作做出三種完全不同的持久化策略：
+現在的文檔只定義了 client 驗證規則，沒有定義 issuer 端的生成規則。
+這會讓規格出現一個危險落差：
 
-1. 全域只存一個最高 sequence
-2. 每個 signer 存一個最高 sequence
-3. 每個 route group / manifest family 存一個最高 sequence
+1. 驗證端是嚴格的
+2. 生成端卻沒有被規範
 
-這三種策略都能“看起來合理”，但互通結果完全不同。
+結果就是，實作很容易在正常運營切換時自己產出一份“簽名正確但 sequence 回退”的合法
+manifest，然後被所有 client 拒絕。
 
 ### 具體修改方案
-這一項應直接在 `control_plane.md` 寫死，不要留給實作猜：
+這裡不能只靠一句“必須全域單調”帶過，至少要把控制面生成模型寫成下面兩種之一：
 
-1. 若你們要全域 anti-rollback，則必須明確規定 `Manifest_Sequence` 在整個控制面
-   命名空間內跨 `CPSK` 也必須單調遞增
-2. 若你們不想把 sequence 與 signer 綁死，則應新增一個固定的 `Manifest_Family_ID`
-   或 `Config_Lineage_ID`，client 以 `(Family_ID, Sequence)` 做 anti-rollback
-3. 若暫時不想引入新欄位，至少要明確寫出：CPSK 輪換不得重置 manifest sequence，
-   否則所有舊 client 都可能把新 manifest 當作 rollback
+1. **單寫者模型**
+   - 任一時刻只有一個 active manifest issuer 可以遞增 sequence
+   - failover 前必須完成 lease/epoch 交接
+2. **外部分配器模型**
+   - 所有 signer 從同一個 monotonic allocator 取得 sequence
+   - allocator 的單調性是控制面安全前提之一
 
-這個問題如果不補，控制面在“穩態”下能跑，但一到 signer rotation 就可能出現大面積
-合法配置被拒絕的事故。
+如果短期內不想把 control plane HA 寫太細，至少要在 `control_plane.md` 補一句：
+
+1. `Manifest_Sequence` 的生成不是各 signer 本地自增
+2. signer rotation / region failover 若不能保證全域單調，寧可暫停發佈，也不能發布回退 sequence
+
+這是新的阻塞點，因為 v12.0 已經不再是“沒答案”，而是“答案需要 operational contract
+支撐”。
 
 ---
 
 ## 2. 高優先級但非阻塞問題
 
-## 2.1 `Endpoint_String` 現在仍然是“簽名上安全、語義上脆弱”的欄位
+## 2.1 `Current -> Next` 的本地決策快取方向是對的，但 cache key / TTL / invalidation 仍然沒有被寫死
 
 ### 攻擊
-把 `Endpoint_String` 直接簽進 canonical body，確實解決了完整性問題。
-但它沒有解決另外一個問題：字串型 endpoint 太容易產生語義上的解析分歧。
+你們這一輪加入 `Cache decision` 是進步，但目前還停留在策略語義，沒有變成規格語義。
 
-例如：
+現在仍然沒被定義的是：
 
-1. host 是域名時是否大小寫規範化
-2. IPv6 是否要求 bracket 格式
-3. 是否允許默認 port
-4. 是否允許額外 path/query
+1. cache key 是 `Node_ID`，還是 `(Node_ID, Endpoint)`，還是 `(Route_Group_ID, Node_ID)`
+2. cache 的有效期多久
+3. manifest 刷新後是否立即失效
+4. overlap window 結束時是否必須清空
 
-如果這些不寫死，不同 client 仍然可能對同一個 `Endpoint_String` 做出不同解讀。
+如果這幾個點不寫死，不同 client 仍然可能出現：
+
+1. 有人過度 stick 到 `Next`
+2. 有人在噪聲網路裡很快又退回 `Current`
 
 ### 具體修改方案
-如果你們想把這件事徹底做乾淨，我仍然建議最終放棄字串 endpoint，改成結構化二進位：
+我建議直接寫死最小規則：
 
-1. `Transport_Kind`
-2. `Host_Type`
-3. `Host`
-4. `Port`
-
-如果短期內不改，至少先在 `control_plane.md` 明確寫出 endpoint grammar。
+1. cache key = `Node_ID`
+2. TTL = `min(Overlap_Window_End - Now, Fixed_Local_Max_TTL)`
+3. 收到更新的 `Node Manifest` 後立即失效
+4. 若握手成功使用 `Current`，則立即覆蓋掉舊的 `Next` 決策
 
 ---
 
-## 2.2 `KEY_UPDATE` 的 mandatory trigger 雖然補上了，但“計數什麼”仍然不夠精確
+## 2.2 `Route_Group` 調度語義現在按 endpoint 展開了，但 key rollover 與故障統計仍然是按 node 定義，兩者的耦合關係還沒寫明
 
 ### 攻擊
-這一輪你們補上了：
+`control_plane.md` 現在要求 client 在同一個 `Route_Group_ID` 內收集所有可用的
+`Endpoint`，再按 `Priority / Weight` 調度。這本身沒問題。
 
-1. `MAX_RECORDS_PER_GENERATION`
-2. `MAX_BYTES_PER_GENERATION`
-3. `MAX_KEY_AGE`
+但 `Deterministic Key Rollover`、`Current/Next`、`Epoch Cert` 綁定、以及失敗統計，
+仍然都是以 `Node_ID` 為單位。
 
-這是實質進步。但 `MAX_BYTES_PER_GENERATION = 1 TB` 這條，現在仍然缺一個關鍵定義：
+這代表 client 內部其實需要處理的是 `(Node_ID, Endpoint)` 這個複合實體，而不是單純的
+endpoint 列表。
 
-到底算的是：
+若不明說，實作者很容易做出兩種不同模型：
 
-1. plaintext bytes
-2. ciphertext bytes
-3. record payload bytes
-4. application bytes
+1. 先選 node，再選 endpoint
+2. 直接把所有 endpoint 攤平後選一個
 
-同樣地，`MAX_KEY_AGE = 1 小時` 也還缺一個參考起點：
-
-1. 從 `Split()` 開始算
-2. 從上一代 commit 開始算
-3. 從第一次使用該 generation 發包開始算
+這兩種模型都能“看起來符合文檔”，但在 fallback、cache、故障統計上結果不同。
 
 ### 具體修改方案
-把這三個常數再補精確：
+建議在 `control_plane.md` 直接補一句規範：
 
-1. `MAX_RECORDS_PER_GENERATION`
-   - 明確是 per-direction、per-generation 的 encrypted record count
-2. `MAX_BYTES_PER_GENERATION`
-   - 明確是 per-direction ciphertext bytes 或 plaintext bytes
-3. `MAX_KEY_AGE`
-   - 明確起點是 generation commit timestamp
+1. endpoint 的調度單位是 `(Node_ID, Endpoint)`，不是脫離 node 的裸 endpoint
+2. `Priority / Weight` 只決定撥號入口選擇
+3. key rollover、security binding、failure cache 一律以 `Node_ID` 為主鍵
 
-這樣不同實作才不會在 rekey 時機上悄悄漂移。
+這樣控制面調度和資料面安全綁定才不會分家。
 
 ---
 
-## 2.3 `Client Auth Fail` 的本地恢復策略仍然太粗，運營上會把“憑證撤銷”和“本地實作錯”混成一類
+## 2.3 `design.md` 和 `protocol.md` 對底層承載的描述仍然有一處明顯不一致，這會繼續污染後面的 transport 設計
 
 ### 攻擊
-現在 `Client Auth Fail (Token 錯)` 在矩陣裡仍然偏粗。對運營來說，
-下面幾種情況需要完全不同的處理：
+`protocol.md` 很清楚地寫的是 reliable in-order byte stream。
+但 `design.md` 第 0.1 節仍然寫了「協議將底層視為不可靠的位元組流承載」。
 
-1. credential 已撤銷
-2. credential id 不存在
-3. proof 生成錯誤
-4. client 使用了舊格式 proof
-
-把這些都寫成 `Check config (Refresh possible)`，對實作是夠用的，對生產事故卻不夠。
+這句話如果只是筆誤，應立即修掉；如果不是筆誤，那就代表 `design.md` 和
+`protocol.md` 在最根本的承載假設上仍然沒有完全一致。
 
 ### 具體修改方案
-如果短期內不想增錯誤碼，至少在文檔裡補一條：
+把 `design.md` 的表述直接收斂成與 `protocol.md` 一致的說法，例如：
 
-1. `GOAWAY 0x05` 只是 auth 失敗的大類
-2. client 本地應維護失敗計數與最近 config version
-3. 連續 refresh 後仍然 `0x05`，應提升為本地 credential / implementation 問題，而不是繼續打控制面
+1. 底層承載在**安全上不可信**
+2. 但在**傳輸語義上**，當前穩定版本要求 reliable in-order byte stream
+
+這樣才能避免後續又把 raw UDP 之類的概念寫進控制面 endpoint。
 
 ---
 
 ## 3. 建議下一輪直接落地的修改順序
 
-如果目標是加快收斂，下一輪我建議按這個順序改：
+如果目標是繼續快收斂，下一輪我建議按這個順序改：
 
-1. 先把 route metadata 的**使用語義**寫死：endpoint grammar、transport class、priority/weight algorithm
-2. 明確 `Manifest_Sequence` 的命名空間與 CPSK 輪換語義，避免 anti-rollback 在 signer rotation 時誤傷
-3. 收窄 `Current -> Next` fallback 的觸發條件，避免把普通網路噪聲誤判成 key rollover
-4. 為 recovery matrix 補一層更細的本地錯誤分類：config / protocol / security / implementation
-5. 把 `KEY_UPDATE` 的 bytes/age 計數語義寫精確
-6. 再決定是否要把 endpoint 最終從字串改成結構化二進位表示
+1. 先把 `Structured Endpoint` 和資料面承載模型對齊，重做 `Transport_Class`
+2. 補一份正式的 client credential / auth realm 控制面物件
+3. 為全域 `Manifest_Sequence` 補 issuer-side operational contract
+4. 把 rollover decision cache 的 key / TTL / invalidation 寫死
+5. 明確 route scheduling 的主鍵是 `(Node_ID, Endpoint)` 還是別的複合單位
+6. 清理 `design.md` 裡對承載可靠性的表述不一致
 
 ---
 
 ## 4. 本輪結論
 
-這一輪我不認為協議還停留在“概念階段”了。你們已經把幾個真正難啃的結構問題
-做成了規格，這點要正式承認。
+v12.0 是一次真正有效的收斂，不是表面修詞。上一輪的幾個核心批評，這一輪大多都被
+正面吸收了。
 
-現在剩下的問題，已經不是大框架錯，而是：
+但新的事實也很清楚：
 
-1. 控制面資料怎麼被所有 client **以同樣方式理解**
-2. anti-rollback 在控制面 signer rotation 時怎麼保持**既嚴格又不中斷**
-3. 噪聲網路下的 rollover fallback 怎麼做到**不誤觸發**
-4. auth / refresh / rekey 這些恢復語義怎麼做到**對運營足夠清晰**
+1. 你們現在的主要風險已經不在 record / rekey 這種純資料面細節
+2. 真正還沒閉環的地方，集中在 **control plane object 是否足以支撐資料面假設**
+3. 特別是 transport endpoint、client credential、manifest issuance contract，
+   這三塊現在已經變成新的結構性阻塞點
 
-把這四件事補齊之後，下一輪 review 就可以真正往參數選型、調度策略和性能邊界
-繼續下沉了。
+把這三塊補齊之後，下一輪 review 才值得真正往性能邊界、調度策略與故障域隔離的
+更深處下沉。
