@@ -1,4 +1,4 @@
-# Chameleon 控制面與信任分發規格 v15.0
+# Chameleon 控制面與信任分發規格 v16.0
 *(Control Plane & Out-of-Band Trust Objects Specification)*
 
 **狀態**: 草案 (Draft)
@@ -81,15 +81,23 @@ Endpoint =
   * **ALPN**: 必須為單一 ASCII 字串。若 `ALPN_Length = 0` 則不傳遞 ALPN。
 
 * **兩階段調度演算法與失敗回饋 (Two-Stage Scheduling & Failure Feedback)**:
+  **定義**: 一次「撥號嘗試」(Dial Attempt) 為對單一 `(Node_ID, Endpoint, KeyChoice)` 的一次物理連線與完整握手嘗試。一次「節點嘗試輪次」(Node Attempt Round) 為對同一 `Node_ID` 下所有合法 Endpoint 與允許的 KeyChoice 探索完畢的過程。
+  **限制**: `Node_Weight` 與 Endpoint `Weight` **絕對禁止為 0**。若為 0 則視為 Manifest 格式錯誤 (Invalid)。
+  
   1. **第一階段 (Node Selection)**: 在同一 `Route_Group_ID` 內，取最小 `Node_Priority` 集合，並在集合內按 `Node_Weight` 執行加權隨機選擇 `Node_ID`。
   2. **第二階段 (Endpoint Selection)**: 在選定的 `Node_ID` 內，取最小 `Priority` 的 Endpoint 集合，在集合內按 `Weight` 執行加權隨機選擇撥號入口。
-  3. **失敗回饋狀態機 (Failure State Machine)**:
-     * **Endpoint Failure**: 單一 Endpoint 撥號失敗或超時，僅將該 Endpoint 從當前嘗試輪次中排除，並在同 Node 內繼續重試其他 Endpoint。不立即懲罰該 `Node_ID`。
-     * **Node Failure**: 僅當某個 `Node_ID` 下的所有 Endpoint 在本輪內皆宣告失敗時，才將該 `Node_ID` 標記為「本輪不可用」，並記錄入 **Node Health Backoff Cache**。隨後返回第一階段，在同一個 `Node_Priority` 集合內繼續選擇其他 `Node_ID`。
-     * **Bucket Escalation**: 只有當當前 `Node_Priority` 集合內的所有 `Node_ID` 均已耗盡或在 Backoff 中，客戶端才允許升級至下一個 `Node_Priority` 集合。
-  4. **狀態主鍵與退避快取**: 
-     * 金鑰輪換 (Key Rollover)、安全綁定 (Security Binding) 與失敗快取 (Failure Cache) **一律以 `Node_ID` 為唯一主鍵**。
-     * **Node Health Backoff Cache**: Cache Key 為 `Node_ID`，TTL 使用指數退避策略 (例如初始 5s, 最大 300s)。處於 Backoff 狀態的 Node 暫不參與第一階段的加權隨機調度。
+  3. **失敗回饋與 Rollover 組合狀態機 (Failure & Rollover State Machine)**:
+     * **決策順序**:
+       1. 根據該 Node_ID 的 Rollover Cache 決定首選 Key (Current 或 Next)。
+       2. 在該 Key 下選擇 Endpoint。
+       3. 若該 Endpoint 出現 `Handshake Timeout / Pre-Auth AEAD Fail / Silent Drop`，且當前處於 Overlap Window，且**尚未**做過 `Current -> Next` 切換，才允許在**同一 Endpoint** 上立即重試一次 `Next`。
+       4. 只有當 `Current` 與 `Next` 在該 Endpoint 上都失敗後，才計入 **Endpoint Failure** (僅將該 Endpoint 從當前嘗試輪次中排除，繼續重試同 Node 內其他 Endpoint)。`TCP Connect Refused/Reset` 直接視為 Endpoint Failure，不參與 Rollover 推斷。
+     * **Node Failure**: 僅當某個 `Node_ID` 下的所有合法 Endpoint 都用盡了合法 Key Path 且皆宣告失敗時，才將該 `Node_ID` 標記為「本輪不可用」，寫入 **Node Health Backoff Cache**。隨後返回第一階段繼續選擇其他 `Node_ID`。
+     * **Bucket Escalation**: 當前 `Node_Priority` 集合內的所有 `Node_ID` 均已耗盡或在 Backoff 中時，才允許升級至下一 `Node_Priority` 集合。
+  4. **退避與快取覆寫 (Backoff & Cache Reset)**: 
+     * **Rollover Cache 覆寫**: 若某 Endpoint 用 `Next` 成功，立即將該 `Node_ID` 的 Rollover Cache 設為 `Prefer Next`，TTL 內同 Node 其他 Endpoint 不得再試 `Current`。若明確有 `Current` 成功，則清除 `Prefer Next`。
+     * **Node Health Backoff Cache**: Cache Key 為 `Node_ID`。退避公式為 `min(Base * 2^N, Max_Backoff) * Jitter(0.8~1.2)`，例如 Base=5s, Max=300s。
+     * **成功重置**: 任一 Node 成功完成握手並通過 `CLIENT_AUTH` 後，該 `Node_ID` 的 Health Backoff Tier 立即清零。
 ```
 
 **規範化被簽體 (Canonical Body): `NodeManifestBody`**
@@ -107,6 +115,18 @@ NodeManifestBody =
 ### 2.3 Auth Realm Manifest (客戶端憑證清單)
 
 為確保 `protocol.md` 中的 `CLIENT_AUTH` 有全域一致的查驗依據，控制面必須分發 `Auth Realm Manifest`。邊緣節點 (Verifier) 僅能依據此清單驗證客戶端，不得依賴私有的本地資料庫。
+
+#### Verifier 時間語義 (Verifier Time Semantics)
+為了確保全球 Verifier 與控制面具備單一且不可分叉的時間真相，所有時鐘校驗必須遵循以下硬性常數與公式：
+* **時間常數**: 
+  * `MAX_VERIFIER_CLOCK_SKEW = 300s` (最大時鐘偏差容忍值)
+  * `MIN_REFRESH_MARGIN = 60s` (刷新安全視窗的最小預留量)
+  * `MAX_REFRESH_JITTER_RATIO = 10%` (刷新隨機抖動上限)
+* **時間校驗公式**:
+  * `Realm Valid if: Now + SKEW >= Issued_At AND Now - SKEW <= Expires_At`
+  * `Credential Valid if: Now + SKEW >= Not_Before AND Now - SKEW <= Not_After`
+* **時鐘來源分工**: 所有 UTC 有效期 (`Issued_At / Expires_At / Not_Before / Not_After`) 必須使用 **Wall Clock**。所有輪詢計時、指數退避 (Retry Backoff) 必須使用 **Monotonic Clock**，以防止 Wall Clock 跳變導致重試雪崩。
+* **時鐘異常應對**: 若 Verifier 本地的 Wall Clock 在短時間內向後跳變超過 `MAX_VERIFIER_CLOCK_SKEW`，或時間早於編譯期的最小可信值，Verifier 必須強制清空現有快取並進入 **Fail-Closed (Maintenance) State**，直至時間重新與 NTP 同步。
 
 **規範化憑證條目 (Canonical Credential Record)**:
 ```text
@@ -143,6 +163,11 @@ AuthRealmBody =
   3. 絕對禁止在 Auth Realm 失效時降級退回任何本地私有資料庫。
   4. 若客戶端的 `Credential_ID` 不存在於此，或 `Status` 為撤銷/暫停，或不在憑證的 `Not_Before` 與 `Not_After` 有效期內，伺服器必須返回對應錯誤 (見 `protocol.md`)。
 
+**未來演進方向 (Future Evolution Notes)**:
+當前的全量清單模型 (Monolithic Realm) 為初期穩定版本。考慮到高頻撤銷與節點規模增長，控制面協議預留了以下演進路徑，實作者應在此模型基礎上保留抽象餘裕：
+1. **Sharded Auth Realm**: 依據 `Credential_ID` 的前綴切割 Shard，Verifier 僅輪詢對應的 Shard 清單，降低單一節點記憶體與輪詢壓力。
+2. **Snapshot + Delta**: 保持全量快照作為基線 (Base)，高頻推送帶有簽章的 `RealmDelta` 物件以實現增量更新。
+
 ---
 
 ## 3. 防回滾與更新語義 (Anti-Rollback & Updates)
@@ -151,18 +176,9 @@ AuthRealmBody =
    * **命名空間與輪換語義 (MUST)**: `Manifest_Sequence` 是在**整個控制面命名空間內全域單調遞增**的數值。即使控制面發生 `CPSK` 輪換 (Signer Rotation)，新 CPSK 簽發的 Manifest 也**絕對不可**重置 Sequence。客戶端必須跨 Signer 執行嚴格的 Anti-Rollback 校驗。
    * **生成端合約 (Issuer Contract)**: 控制面必須保證全域單調性。這要求控制面採用**單寫者模型 (Single-Writer Model)** 或外部分配器 (Monotonic Allocator)。若發生 Signer Rotation 或 Region Failover 時無法保證全域單序，控制面寧可暫停發佈，也絕對不可發佈回退的 Sequence，否則會導致所有客戶端永久拒絕更新。
 2. **平滑金鑰輪換算法 (Deterministic Key Rollover)**:
-   對同一個 `Node ID`，客戶端在發起新連線 (Session) 時，**必須**使用以下確定性算法選擇 Noise `NK` 的預期公鑰 (`Expected_Server_Pubkey`)：
+   對同一個 `Node ID`，客戶端的允許公鑰必須遵守嚴格的時間視窗：
    * 若 `Now < Next_Not_Before` (或不存在 Next Key)：只能使用 `Current_Static_Pubkey`。
-   * 若 `Next_Not_Before <= Now < Current_Not_After` (重疊視窗 Overlap Window)：
-     * 第一次嘗試必須使用 `Current_Static_Pubkey`。
-     * **僅當**該次嘗試在**單一 Endpoint 上**以 `Handshake Timeout / Handshake AEAD Fail / Silent Drop` 結束，且此 `Node ID` 明確宣告了 `Next_Static_Pubkey` 時，允許**一次** `Current -> Next` 的 fallback。
-     * **抗噪聲規則 (Noise Resistance)**: 
-       1. 若客戶端在同一個 Route Group 的多個 Node ID 上同時觀察到 Timeout，應優先視為網路路由異常或遭封鎖，而不是 Key Rollover。
-       2. **本地決策快取 (Local Decision Cache)**: Fallback 後，客戶端必須將決策存入快取。
-          * **Cache Key**: `Node_ID`。
-          * **TTL**: `min(Current_Not_After - Now, Fixed_Local_Max_TTL)` (例如 3600 秒)。
-          * **失效 (Invalidation)**: 收到包含該 `Node_ID` 的新 `Node Manifest` 後立即失效；或若後續握手成功使用了 `Current_Static_Pubkey`，則立即覆蓋清除該 `Next` 決策。
-          此快取確保該 `Node ID` 短時間內不再於 Current / Next 之間反覆抖動。同一輪撥號最多允許一次切換。只有在 Overlap Window 內才允許此特殊 Fallback。
+   * 若 `Next_Not_Before <= Now < Current_Not_After` (重疊視窗 Overlap Window)：允許使用 Current 或 Next。具體的 fallback 觸發時機與快取策略已統合至 `2.2 節` 的「失敗回饋與 Rollover 組合狀態機」。
    * 若 `Now >= Current_Not_After`：只能使用 `Next_Static_Pubkey`。
    * **硬性安全約束**: 若伺服器回傳的 `Epoch Cert` 中的公鑰既不等於客戶端選定的 `Current`，也不等於 `Next`，客戶端必須視為配置失配/遭劫持，立即中斷，不得默默接受。
 3. **撤銷語義 (Revocation)**:

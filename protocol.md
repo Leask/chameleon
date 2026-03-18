@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v15.0
+# Chameleon 網路通訊協議規格書 v16.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -346,10 +346,12 @@ Noise `NK` 第二條訊息的序列化：
 | **Responder Key Mismatch**    | Client | [S] | Abort Transport | None | Hard security failure, stop route |
 | **Epoch Cert Not Yet Valid**  | Client | [C] | Abort Transport | None | Check local clock |
 | **Epoch Cert Expired**        | Client | [C] | Abort Transport | None | Freshness lag; Retry different node, refresh config |
-| **Auth Realm Sig Invalid / Expired**| Server | [C] / [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x06)` | Verifier polls control-plane for sync |
-| **Auth Realm Rollback Detected**| Server | [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x07)` | Security Incident; Verifier halts updates |
+| **Auth Realm Sig Invalid**| Server | [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x07)` | Security Incident; Verifier halts updates. Client: Taint route-group, alert operator. |
+| **Auth Realm Rollback Detected**| Server | [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x07)` | Security Incident; Verifier halts updates. Client: Taint route-group, alert operator. |
+| **Auth Realm Expired/Lagging**| Server | [C] | Fail-Closed (Reject Auth) | `GOAWAY (0x06)` | Verifier polls control-plane for sync. Client: Switch Node with Route-Group jitter & backoff. |
+| **Credential Not Yet Valid**  | Server | [C] / [I] | Abort Transport | `GOAWAY (0x06)` | Issuer misconfig or Verifier clock drift. Client: Switch Node. |
 | **Capability Mismatch**       | Client | [P] | Abort Transport | None | Feature mismatch; Do not retry same capability set |
-| **Client Auth Fail (Token 錯)**| Server | [I] | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
+| **Client Auth Fail (Expired/Revoked)**| Server | [I] | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
 | **Unsupported Auth Scheme**   | Server | [P] | Hard Close | `GOAWAY (0x02)` | Upgrade Client |
 | **Provisional Bound Exceeded**| Server | [I] | Abort Transport | None (Pre-Auth Drop) | App Bug / Rate Limit Triggered |
 | **Record Header/MAC Fail**    | Both | [S] | Abort Transport | None | Retry Same Node (限1次) / Switch |
@@ -358,5 +360,6 @@ Noise `NK` 第二條訊息的序列化：
 | **Server Maintenance/ID Exhaust**| Both | [C] | Wait for Drain | `GOAWAY (0x00)` | Reassign New Channels to Pool |
 
 **關於 `Client Auth Fail` 的運營避險規則**:
-客戶端收到 `GOAWAY 0x05` 時，可以嘗試一次 Config Refresh。若連續 Refresh 後仍然發生 `0x05`，必須認知為**客戶端本地憑證已撤銷 (Revoked) 或實作錯誤 (Implementation Bug)**，並停止對控制面發起無意義的輪詢雪崩。
-若客戶端收到 `GOAWAY 0x06` 或 `0x07`，表示問題出在邊緣節點 (Verifier) 側的控制面同步狀態，客戶端本地 Refresh 無效，應在本地觸發換點 (Switch Node) 重試邏輯，以尋找已同步健康的節點。
+客戶端收到 `GOAWAY 0x05` 時，可以嘗試一次 Config Refresh。若連續 Refresh 後仍然發生 `0x05`，必須認知為**客戶端本地憑證已撤銷 (Revoked)、過期 (Expired) 或實作錯誤 (Implementation Bug)**，並停止對控制面發起無意義的輪詢雪崩。
+若客戶端收到 `GOAWAY 0x06`，表示問題出在邊緣節點 (Verifier) 側的控制面同步滯後或本地時鐘異常，客戶端本地 Refresh 無效，應在本地觸發換點 (Switch Node) 重試邏輯，以尋找已同步健康的節點，並伴隨 Route-Group 級別的退避與抖動。
+若客戶端收到 `GOAWAY 0x07`，表示 Verifier 發生嚴重安全事件 (如簽章失效或版本回滾)。客戶端**絕不可盲目地快速 Switch Node**，這會將本地失敗放大為全網風暴；必須暫時污染 (Taint) 當前的 Route-Group 並壓制高頻重試，提示 Operator 介入檢查。
