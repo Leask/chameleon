@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v13.0
+# Chameleon 網路通訊協議規格書 v14.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -344,6 +344,8 @@ Noise `NK` 第二條訊息的序列化：
 | **Responder Key Mismatch**    | Client | [S] | Abort Transport | None | Hard security failure, stop route |
 | **Epoch Cert Not Yet Valid**  | Client | [C] | Abort Transport | None | Check local clock |
 | **Epoch Cert Expired**        | Client | [C] | Abort Transport | None | Freshness lag; Retry different node, refresh config |
+| **Auth Realm Sig Invalid / Expired**| Server | [C] / [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x01)` | Verifier polls control-plane for sync |
+| **Auth Realm Rollback Detected**| Server | [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x01)` | Security Incident; Verifier halts updates |
 | **Capability Mismatch**       | Client | [P] | Abort Transport | None | Feature mismatch; Do not retry same capability set |
 | **Client Auth Fail (Token 錯)**| Server | [I] / [C] | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
 | **Unsupported Auth Scheme**   | Server | [P] | Hard Close | `GOAWAY (0x02)` | Upgrade Client |
@@ -354,4 +356,7 @@ Noise `NK` 第二條訊息的序列化：
 | **Server Maintenance/ID Exhaust**| Both | [C] | Wait for Drain | `GOAWAY (0x00)` | Reassign New Channels to Pool |
 
 **關於 `Client Auth Fail` 的運營避險規則**:
-客戶端收到 `GOAWAY 0x05` 時，可以嘗試一次 Config Refresh。若連續 Refresh 後仍然發生 `0x05`，必須升級為**本地憑證已撤銷 (Revoked) 或本地實作錯誤 (Implementation Bug)**，客戶端必須停止無意義的重試並暫停控制面輪詢，避免對控制面發起雪崩式請求。
+客戶端收到 `GOAWAY 0x05` 時，可以嘗試一次 Config Refresh。若連續 Refresh 後仍然發生 `0x05`，必須認知到以下兩種可能之一：
+1. **客戶端本地憑證已撤銷 (Revoked) 或實作錯誤 (Implementation Bug)**。
+2. **邊緣節點 (Verifier) 持有過期或未同步的 Auth Realm Manifest (Freshness Lag)**。
+無論是哪種情況，客戶端本地的持續重試與 Refresh 均無法解決問題，因此客戶端**必須停止無意義的重試並暫停控制面輪詢**，避免對控制面發起雪崩式請求。

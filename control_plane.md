@@ -1,4 +1,4 @@
-# Chameleon 控制面與信任分發規格 v13.0
+# Chameleon 控制面與信任分發規格 v14.0
 *(Control Plane & Out-of-Band Trust Objects Specification)*
 
 **狀態**: 草案 (Draft)
@@ -47,6 +47,8 @@ CPSKCertBody =
 NodeEntry =
   Node_ID_Length (1 byte) || Node_ID (ASCII) ||
   Route_Group_ID_Length (1 byte) || Route_Group_ID (ASCII) ||
+  Node_Priority (4 bytes) ||
+  Node_Weight (4 bytes) ||
   Current_Static_Pubkey (32 bytes) ||
   Current_Not_After (8 bytes) ||
   Has_Next_Key (1 byte, 0x00 或 0x01) ||
@@ -54,6 +56,7 @@ NodeEntry =
   [Optional: Next_Not_Before (8 bytes)] ||
   Endpoint_Count (1 byte) ||
   Endpoint[0] || ... || Endpoint[N-1]
+```
 
 **結構化端點 (Structured Endpoint): `Endpoint`**
 ```text
@@ -66,13 +69,21 @@ Endpoint =
 
 * **Bearer_Type 與參數 (Bearer Params)**:
   * `0x01` (**TCP_STREAM**): `Host_Type (1) || Host_Length (1) || Host (Var) || Port (2)`
-  * `0x02` (**QUIC_STREAM**): `Host_Type (1) || Host_Length (1) || Host (Var) || Port (2) || ALPN_Length (1) || ALPN (Var) || SNI_Mode (1)`
+  * `0x02` (**QUIC_STREAM**): `Host_Type (1) || Host_Length (1) || Host (Var) || Port (2) || ALPN_Length (1) || ALPN (Var) || SNI_Mode (1) || [Optional: SNI_Length (1) || SNI (Var)]`
   * `0x03` (**WS_STREAM**): `Host_Type (1) || Host_Length (1) || Host (Var) || Port (2) || Path_Length (1) || Path (Var) || TLS_Mode (1) || Host_Header_Length (1) || Host_Header (Var)`
-* **Host_Type 與長度約束**: `0x01` (IPv4), `0x02` (IPv6), `0x03` (Domain)。**硬性約束**：若 `Host_Type = 0x01`，`Host_Length` 必須固定為 4；若 `Host_Type = 0x02`，`Host_Length` 必須固定為 16。若長度不符，整個 Manifest 驗證失敗。
-* **調度單位與主鍵 (Scheduling Unit & Primary Key)**:
-  1. 客戶端在同一個 `Route_Group_ID` 內收集可用資源，調度的最小執行單位是 **`(Node_ID, Endpoint)` 複合實體**。
-  2. `Priority` 與 `Weight` 僅決定特定 `Node_ID` 下，不同撥號入口的嘗試順序與加權。
-  3. 金鑰輪換 (Key Rollover)、安全綁定 (Security Binding) 與失敗快取 (Failure Cache) **一律以 `Node_ID` 為唯一主鍵**，不與單一 Endpoint 綁定。
+
+* **Bearer Enum 與語法強制約束**:
+  * **Host_Type**: `0x01` (IPv4, 固定 4 bytes), `0x02` (IPv6, 固定 16 bytes), `0x03` (Domain, ASCII)。若長度不符，整個 Manifest 驗證失敗。
+  * **SNI_Mode**: `0x00` (None), `0x01` (Use Host as SNI, 此時不可附帶 SNI 欄位), `0x02` (Explicit SNI, 必須附帶後續的 `SNI_Length || SNI` 欄位)。
+  * **TLS_Mode**: `0x00` (Plain), `0x01` (TLS)。
+  * **WS Path**: 必須為 ASCII，不允許空字串，且必須以 `/` 開頭。
+  * **Host_Header**: 若 `Host_Header_Length = 0`，代表預設使用 `Host` 的值；若長度大於 0，則允許顯式覆蓋 (可與 SNI 獨立)。
+  * **ALPN**: 必須為單一 ASCII 字串。若 `ALPN_Length = 0` 則不傳遞 ALPN。
+
+* **兩階段調度演算法 (Two-Stage Scheduling)**:
+  1. **第一階段 (Node Selection)**: 在同一 `Route_Group_ID` 內，根據 `Node_Priority` (數值越小越優先) 與 `Node_Weight` 選擇 `Node_ID`。
+  2. **第二階段 (Endpoint Selection)**: 在選定的 `Node_ID` 內，按 Endpoint 的 `Priority` 與 `Weight` 選擇具體的撥號入口。
+  3. **狀態主鍵**: 金鑰輪換 (Key Rollover)、安全綁定 (Security Binding) 與失敗快取 (Failure Cache) **一律以 `Node_ID` 為唯一主鍵**，確保路由調度與安全狀態隔離。
 ```
 
 **規範化被簽體 (Canonical Body): `NodeManifestBody`**
@@ -105,14 +116,21 @@ ClientCredentialRecord =
 AuthRealmBody =
   Realm_Version (1 byte, 值為 0x01) ||
   Realm_Sequence (8 bytes) ||
+  Issued_At (8 bytes) ||
+  Expires_At (8 bytes) ||
   Signer_Key_ID (8 bytes) ||
   Record_Count (4 bytes) ||
   ClientCredentialRecord[0] || ... || ClientCredentialRecord[N-1]
 ```
 
-**簽章與封裝**:
+**簽章、更新與 Verifier Fail-Closed 語義**:
 * `Realm_Signature` = `Sign(CPSK_Private_Key, "chameleon-auth-realm-v1" || AuthRealmBody)`。
-* 邊緣節點必須快取並定期輪詢此清單。若客戶端的 `Credential_ID` 不存在於此或狀態為 `Revoked/Suspended`，伺服器必須返回 `GOAWAY 0x05`。
+* 邊緣節點 (Verifier) 必須快取並定期輪詢此清單。
+* **生命週期與 Anti-Rollback**: `Auth Realm Manifest` 具有與 `Node Manifest` 完全相同的生命週期與 Issuer Contract 語義。`Realm_Sequence` 必須在控制面全域單調遞增（跨 Signer Rotation 亦然）。邊緣節點必須嚴格校驗 Sequence 防回滾。
+* **Verifier Fail-Closed 規則**: 
+  1. 若清單缺失、`Expires_At` 已過期，或 `Realm_Signature` 驗證失敗，邊緣節點必須**Fail-Closed (拒絕所有新的 CLIENT_AUTH)**。
+  2. 絕對禁止在 Auth Realm 失效時降級退回任何本地私有資料庫。
+  3. 若客戶端的 `Credential_ID` 不存在於此或狀態為 `Revoked/Suspended`，伺服器必須返回 `GOAWAY 0x05`。
 
 ---
 
