@@ -1,4 +1,4 @@
-# Chameleon 網路通訊協議規格書 v14.0
+# Chameleon 網路通訊協議規格書 v15.0
 *(Chameleon Network Protocol Specification)*
 
 **狀態**: 草案 (Draft)
@@ -196,7 +196,7 @@ Noise `NK` 第二條訊息的序列化：
    * **安全性**: 此設計將客戶端的長期身份 (`Credential ID`) 與這一次特定的物理連線 (`Transcript Hash`) 進行了上下文隔離的密碼學綁定，徹底杜絕了 Auth Token 被跨連線、跨協議重放的可能。
 4. **錯誤處置**:
    * 若 `Auth Scheme` 不支援，伺服器必須發送 `GOAWAY (Code: 0x02 Protocol Violation)` 並硬關閉連線。
-   * 若支援但驗證失敗（ID 不存在、簽名錯誤、或該 ID 已被撤銷），伺服器必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
+   * 若支援但驗證失敗（ID 不存在、簽名錯誤、憑證已被撤銷/暫停，或不在 `Not_Before` 與 `Not_After` 的有效期內），伺服器必須發送 `GOAWAY (Code: 0x05 Auth Failed)` 並硬關閉連線。
 
 ### 5.1 通道層 Frames (Channel Lifecycle & Multiplexing)
 
@@ -317,11 +317,13 @@ Noise `NK` 第二條訊息的序列化：
 `Last Accepted Channel ID` 明確劃定了排空 (Draining) 邊界。對於接收方來說，所有已發出且 Channel ID **大於**此值的 `OPEN_CHANNEL` 請求，皆視為被發送方**隱式拒絕 (Implicitly Rejected)**，必須立即釋放關聯資源；小於或等於此值的通道允許繼續 Draining 直至 `FIN`。
 **錯誤碼矩陣:**
 * `0x00`: 優雅退出 (如伺服器進入維護、憑證即將到期)。
-* `0x01`: 內部錯誤。
+* `0x01`: 內部錯誤 (Generic Internal Error)。
 * `0x02`: 協議違規 (如未知的 Frame Type)。
 * `0x03`: 流量控制溢出 (Flow Control Overflow)。
 * `0x04`: 解密/完整性違規。
-* `0x05`: 客戶端授權失敗 (Auth Failed)。
+* `0x05`: 客戶端授權失敗 (Auth Failed: Credentials revoked, missing, or proof invalid)。
+* `0x06`: 驗證器未同步 (Auth Realm Out of Sync / Freshness Lag)。
+* `0x07`: 驗證器安全事件 (Auth Realm Rollback Detected / Signature Invalid)。
 
 #### `0xFF` PAD (流量特徵填充)
 `[Type(1)] [Pad Length (2 bytes)] [Padding Bytes...]`
@@ -344,10 +346,10 @@ Noise `NK` 第二條訊息的序列化：
 | **Responder Key Mismatch**    | Client | [S] | Abort Transport | None | Hard security failure, stop route |
 | **Epoch Cert Not Yet Valid**  | Client | [C] | Abort Transport | None | Check local clock |
 | **Epoch Cert Expired**        | Client | [C] | Abort Transport | None | Freshness lag; Retry different node, refresh config |
-| **Auth Realm Sig Invalid / Expired**| Server | [C] / [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x01)` | Verifier polls control-plane for sync |
-| **Auth Realm Rollback Detected**| Server | [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x01)` | Security Incident; Verifier halts updates |
+| **Auth Realm Sig Invalid / Expired**| Server | [C] / [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x06)` | Verifier polls control-plane for sync |
+| **Auth Realm Rollback Detected**| Server | [S] | Fail-Closed (Reject Auth) | `GOAWAY (0x07)` | Security Incident; Verifier halts updates |
 | **Capability Mismatch**       | Client | [P] | Abort Transport | None | Feature mismatch; Do not retry same capability set |
-| **Client Auth Fail (Token 錯)**| Server | [I] / [C] | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
+| **Client Auth Fail (Token 錯)**| Server | [I] | Abort Transport | `GOAWAY (0x05)` | Client: Check config (Refresh possible) |
 | **Unsupported Auth Scheme**   | Server | [P] | Hard Close | `GOAWAY (0x02)` | Upgrade Client |
 | **Provisional Bound Exceeded**| Server | [I] | Abort Transport | None (Pre-Auth Drop) | App Bug / Rate Limit Triggered |
 | **Record Header/MAC Fail**    | Both | [S] | Abort Transport | None | Retry Same Node (限1次) / Switch |
@@ -356,7 +358,5 @@ Noise `NK` 第二條訊息的序列化：
 | **Server Maintenance/ID Exhaust**| Both | [C] | Wait for Drain | `GOAWAY (0x00)` | Reassign New Channels to Pool |
 
 **關於 `Client Auth Fail` 的運營避險規則**:
-客戶端收到 `GOAWAY 0x05` 時，可以嘗試一次 Config Refresh。若連續 Refresh 後仍然發生 `0x05`，必須認知到以下兩種可能之一：
-1. **客戶端本地憑證已撤銷 (Revoked) 或實作錯誤 (Implementation Bug)**。
-2. **邊緣節點 (Verifier) 持有過期或未同步的 Auth Realm Manifest (Freshness Lag)**。
-無論是哪種情況，客戶端本地的持續重試與 Refresh 均無法解決問題，因此客戶端**必須停止無意義的重試並暫停控制面輪詢**，避免對控制面發起雪崩式請求。
+客戶端收到 `GOAWAY 0x05` 時，可以嘗試一次 Config Refresh。若連續 Refresh 後仍然發生 `0x05`，必須認知為**客戶端本地憑證已撤銷 (Revoked) 或實作錯誤 (Implementation Bug)**，並停止對控制面發起無意義的輪詢雪崩。
+若客戶端收到 `GOAWAY 0x06` 或 `0x07`，表示問題出在邊緣節點 (Verifier) 側的控制面同步狀態，客戶端本地 Refresh 無效，應在本地觸發換點 (Switch Node) 重試邏輯，以尋找已同步健康的節點。

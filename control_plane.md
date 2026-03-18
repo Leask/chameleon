@@ -1,4 +1,4 @@
-# Chameleon 控制面與信任分發規格 v14.0
+# Chameleon 控制面與信任分發規格 v15.0
 *(Control Plane & Out-of-Band Trust Objects Specification)*
 
 **狀態**: 草案 (Draft)
@@ -80,10 +80,16 @@ Endpoint =
   * **Host_Header**: 若 `Host_Header_Length = 0`，代表預設使用 `Host` 的值；若長度大於 0，則允許顯式覆蓋 (可與 SNI 獨立)。
   * **ALPN**: 必須為單一 ASCII 字串。若 `ALPN_Length = 0` 則不傳遞 ALPN。
 
-* **兩階段調度演算法 (Two-Stage Scheduling)**:
-  1. **第一階段 (Node Selection)**: 在同一 `Route_Group_ID` 內，根據 `Node_Priority` (數值越小越優先) 與 `Node_Weight` 選擇 `Node_ID`。
-  2. **第二階段 (Endpoint Selection)**: 在選定的 `Node_ID` 內，按 Endpoint 的 `Priority` 與 `Weight` 選擇具體的撥號入口。
-  3. **狀態主鍵**: 金鑰輪換 (Key Rollover)、安全綁定 (Security Binding) 與失敗快取 (Failure Cache) **一律以 `Node_ID` 為唯一主鍵**，確保路由調度與安全狀態隔離。
+* **兩階段調度演算法與失敗回饋 (Two-Stage Scheduling & Failure Feedback)**:
+  1. **第一階段 (Node Selection)**: 在同一 `Route_Group_ID` 內，取最小 `Node_Priority` 集合，並在集合內按 `Node_Weight` 執行加權隨機選擇 `Node_ID`。
+  2. **第二階段 (Endpoint Selection)**: 在選定的 `Node_ID` 內，取最小 `Priority` 的 Endpoint 集合，在集合內按 `Weight` 執行加權隨機選擇撥號入口。
+  3. **失敗回饋狀態機 (Failure State Machine)**:
+     * **Endpoint Failure**: 單一 Endpoint 撥號失敗或超時，僅將該 Endpoint 從當前嘗試輪次中排除，並在同 Node 內繼續重試其他 Endpoint。不立即懲罰該 `Node_ID`。
+     * **Node Failure**: 僅當某個 `Node_ID` 下的所有 Endpoint 在本輪內皆宣告失敗時，才將該 `Node_ID` 標記為「本輪不可用」，並記錄入 **Node Health Backoff Cache**。隨後返回第一階段，在同一個 `Node_Priority` 集合內繼續選擇其他 `Node_ID`。
+     * **Bucket Escalation**: 只有當當前 `Node_Priority` 集合內的所有 `Node_ID` 均已耗盡或在 Backoff 中，客戶端才允許升級至下一個 `Node_Priority` 集合。
+  4. **狀態主鍵與退避快取**: 
+     * 金鑰輪換 (Key Rollover)、安全綁定 (Security Binding) 與失敗快取 (Failure Cache) **一律以 `Node_ID` 為唯一主鍵**。
+     * **Node Health Backoff Cache**: Cache Key 為 `Node_ID`，TTL 使用指數退避策略 (例如初始 5s, 最大 300s)。處於 Backoff 狀態的 Node 暫不參與第一階段的加權隨機調度。
 ```
 
 **規範化被簽體 (Canonical Body): `NodeManifestBody`**
@@ -108,6 +114,8 @@ ClientCredentialRecord =
   Credential_ID (8 bytes) ||
   Auth_Scheme (1 byte, 0x01 表示 Ed25519) ||
   Client_Public_Key (32 bytes) ||
+  Not_Before (8 bytes, UTC 秒數) ||
+  Not_After (8 bytes, UTC 秒數) ||
   Status (1 byte, 0x01=Active, 0x02=Revoked, 0x03=Suspended)
 ```
 
@@ -123,14 +131,17 @@ AuthRealmBody =
   ClientCredentialRecord[0] || ... || ClientCredentialRecord[N-1]
 ```
 
-**簽章、更新與 Verifier Fail-Closed 語義**:
+**簽章、更新與 Verifier 運營合約 (Verifier Operational Contract)**:
 * `Realm_Signature` = `Sign(CPSK_Private_Key, "chameleon-auth-realm-v1" || AuthRealmBody)`。
-* 邊緣節點 (Verifier) 必須快取並定期輪詢此清單。
-* **生命週期與 Anti-Rollback**: `Auth Realm Manifest` 具有與 `Node Manifest` 完全相同的生命週期與 Issuer Contract 語義。`Realm_Sequence` 必須在控制面全域單調遞增（跨 Signer Rotation 亦然）。邊緣節點必須嚴格校驗 Sequence 防回滾。
+* **Anti-Rollback 與持久化**: `Realm_Sequence` 必須在全域控制面單調遞增 (包含 CPSK 輪換)。邊緣節點必須將已接受的最高 `Realm_Sequence` 持久化至磁碟。重啟後需載入持久化狀態，嚴格拒絕 Sequence 回退，防止舊清單回放。
+* **輪詢刷新狀態機 (Refresh State Machine)**:
+  1. **Soft Refresh Threshold**: Verifier 必須在 `Expires_At - Refresh_Margin` (例如提前 10%) 時主動輪詢更新，並必須加入隨機抖動 (Jitter) 以避免雪崩。
+  2. **Retry Backoff**: 輪詢失敗必須採用指數退避 (Exponential Backoff)，重試邊界不得超過 `Expires_At`。
 * **Verifier Fail-Closed 規則**: 
-  1. 若清單缺失、`Expires_At` 已過期，或 `Realm_Signature` 驗證失敗，邊緣節點必須**Fail-Closed (拒絕所有新的 CLIENT_AUTH)**。
-  2. 絕對禁止在 Auth Realm 失效時降級退回任何本地私有資料庫。
-  3. 若客戶端的 `Credential_ID` 不存在於此或狀態為 `Revoked/Suspended`，伺服器必須返回 `GOAWAY 0x05`。
+  1. 若超出 `Expires_At` 仍無法拉取新清單，或 `Realm_Signature` 驗證失敗，邊緣節點必須**Fail-Closed (立即拒絕所有新的 CLIENT_AUTH)**。
+  2. 冷啟動 (Bootstrap) 時若無有效的本地快取，必須進入 Fail-Closed，不允許放行任何連線。
+  3. 絕對禁止在 Auth Realm 失效時降級退回任何本地私有資料庫。
+  4. 若客戶端的 `Credential_ID` 不存在於此，或 `Status` 為撤銷/暫停，或不在憑證的 `Not_Before` 與 `Not_After` 有效期內，伺服器必須返回對應錯誤 (見 `protocol.md`)。
 
 ---
 
