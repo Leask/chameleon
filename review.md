@@ -1,338 +1,446 @@
-# Chameleon Review
-## 對 `design.md` v14.0、`protocol.md` v14.0 與 `control_plane.md` v14.0 的新一輪聯合審查
+# Chameleon 聯合審查意見 v15.0
 
-這一輪和上一輪相比，協議已經明顯往「完整系統規格」走，而不是只是在補欄位。
-`Auth Realm Manifest` 的生命週期、`Node_Priority / Node_Weight` 的兩階段調度、
-以及 `Bearer_Params` 的枚舉封口，說明你們已經開始處理真正會影響互通與運營的深水區。
+本輪審查不再重複早已指出的欄位缺失。`v15.0` 的進步是明確的：
+兩階段調度終於補上了失敗回饋狀態機，`Auth Realm Manifest`
+補上了 Verifier 的輪詢/持久化合約，單條客戶端憑證也有了
+`Not_Before / Not_After`，而且 `0x06 / 0x07` 也開始嘗試把
+「Verifier 未同步」與「Verifier 安全事件」拆開。這些都不是小修補，
+而是結構上的前進。
 
-但也正因為如此，剩下的問題不再是「有沒有欄位」，而是：
-這些新引入的機制是否真的形成了**可收斂的狀態機**、**可維持的控制面負載模型**，
-以及**可預期的故障恢復行為**。
+但 `v15.0` 仍然沒有完全閉環。現在的主要問題已經不是「少一個欄位」，
+而是三類更硬的規範缺口：
+
+1. `Auth Realm` 已經被提升為資料面授權的核心依賴，但 verifier
+   本地時間、freshness、fail-closed 的時間語義還沒有被正式封死。
+2. 兩階段調度的失敗回饋，和 `Current -> Next` key rollover 的本地
+   fallback，仍然是兩套各自成立、但沒有組合規則的狀態機。
+3. `0x06 / 0x07` 雖然被引入，但 `design.md`、`protocol.md`、
+   recovery matrix、客戶端恢復策略四者之間仍然存在語義分叉。
+
+下面只攻擊仍然會導致實作分叉、誤恢復、或運營雪崩的點。
 
 ---
 
-## 0. 本輪可以正式關閉的舊問題
+## 0. 本輪已解決或可正式降級的問題
 
-### 0.1 `Auth Realm Manifest` 已經不再只是靜態資料結構
-上一輪我打的是它沒有 freshness、anti-rollback、fail-closed。
-這一輪 `control_plane.md` 已經補上：
+以下問題可從主審查列表中降級，不需要下一輪再重複打：
 
-1. `Issued_At / Expires_At`
-2. `Realm_Sequence`
-3. 與 `Node Manifest` 對齊的 issuer contract
-4. verifier fail-closed
-
-這個大洞可以正式降級。
-
-### 0.2 `Route_Group` 已不再完全缺跨 node 調度語義
-你們現在至少明確寫出了兩階段調度：
-
-1. 先在 route group 內選 `Node_ID`
-2. 再在 node 內選 `Endpoint`
-
-這讓 route-group selection 首次有了結構。
-
-### 0.3 `Bearer_Params` 已不再停留在“欄位存在但語義靠猜”
-`SNI_Mode`、`TLS_Mode`、`WS Path`、`Host_Header`、`ALPN` 都已經有了第一版硬規則。
-這使得上輪那種“大家自己補默認值”的風險已經明顯下降。
-
-### 0.4 `design.md` 的過度宣稱已經被回收
-你們把 v13.0 那種接近「完美閉環」的語氣收斂到了更工程化的說法，這是對的。
+1. **兩階段調度不再只是靜態結構**。`control_plane.md`
+   現在至少定義了 Node/Endpoint 兩層選擇和 Node 級 backoff。
+2. **`Auth Realm` 不再只有資料結構**。現在已有 `Issued_At`、
+   `Expires_At`、`Realm_Sequence`、持久化與 refresh/backoff contract。
+3. **單條憑證生命週期已補齊**。`ClientCredentialRecord`
+   已有 `Not_Before / Not_After`，先前「只能靠全量清單過期」的批評
+   可以降級。
+4. **`0x06 / 0x07` 的方向是對的**。問題不在於要不要拆，而在於目前
+   拆得還不夠精確。
 
 ---
 
 ## 1. 阻塞級問題
 
-## 1.1 兩階段調度現在只有“選擇結構”，還沒有“失敗回饋狀態機”，在真實敵意網路下仍然會表現為不可預測
+### 1.1 Verifier 的時間語義仍未正式規範化
 
-### 攻擊
-`control_plane.md` 現在定義了：
+這是本輪最重要的阻塞點。`protocol.md` 已經給了
+`Epoch Cert` 的 `MAX_CLOCK_SKEW = 300` 秒，但這個時鐘容忍模型只存在於
+客戶端驗證 `Epoch Cert` 的流程裡，沒有延伸到控制面的 `Auth Realm`
+驗證與 verifier 的授權決策。現在有三組時間欄位已經成為資料面行為的
+硬依賴：
 
-1. 第一階段：按 `Node_Priority / Node_Weight` 選 `Node_ID`
-2. 第二階段：按 `Endpoint Priority / Weight` 選 `Endpoint`
-3. 安全狀態與 failure cache 以 `Node_ID` 為主鍵
+1. `AuthRealmBody.Issued_At / Expires_At`
+2. `ClientCredentialRecord.Not_Before / Not_After`
+3. Verifier 本地的 `Refresh_Margin`、輪詢重試窗口與 fail-closed 邊界
 
-這在靜態情況下沒問題，但一旦進入真實失敗場景，規格立刻又變模糊了。
+目前規格缺的是這些時間如何與 verifier 本地時鐘互動。這會直接造成四個
+實作分叉：
 
-目前還沒被定義的是：
+1. **快時鐘節點**：
+   verifier 可能提前把仍有效的 `Auth Realm` 視為過期，進而對所有新
+   `CLIENT_AUTH` 回 `0x06` 或直接 fail-closed。
+2. **慢時鐘節點**：
+   verifier 可能長時間接受已過期的 realm 或已失效的單條 credential。
+3. **跨節點語義不一致**：
+   同一份 `Auth Realm`，不同節點因本地時鐘偏差而對同一客戶端做出不同
+   授權決策，結果就是 client 在同一 `Route_Group` 內反覆命中互相矛盾
+   的節點。
+4. **冷啟動/時鐘異常下的雪崩**：
+   若節點啟動時系統時間嚴重偏移，`Expires_At - Refresh_Margin`
+   會立刻失真。實作 A 可能立刻瘋狂輪詢，實作 B 可能直接 fail-closed，
+   實作 C 可能繼續服務舊 realm。這會讓控制面與資料面同時不穩。
 
-1. 在同一 `Node_Priority` bucket 內，是否必須做 weighted-random，還是可做任意排序
-2. 當某個 `Node_ID` 一次撥號失敗後，它是：
-   - 只在本次撥號中暫時排除
-   - 還是要進入短期 backoff
-   - 還是要寫入某種 health cache
-3. 若某個 `Node_ID` 被選中，但它下面所有 endpoint 都失敗了：
-   - 是否立即回到同一 node bucket 裡選其他 node
-   - 是否升到下一個 `Node_Priority`
-4. 若某個 endpoint 失敗：
-   - 是否只懲罰該 endpoint
-   - 還是懲罰整個 `Node_ID`
-5. node-level failure cache 與 rollover cache 的優先順序如何疊加
+#### 為什麼 v15.0 的修補還不夠
 
-這些不是實作細節，而是 availability 行為本身。
+`control_plane.md` 的 refresh contract 目前只說：
 
-### 為什麼目前還不夠
-你們現在有了 route selection 的骨架，但沒有 failure feedback 的閉環。
-結果就是，兩個實作都能聲稱自己“遵守了優先級與加權”，卻在失敗後做出完全不同的收斂：
+1. 在 `Expires_At - Refresh_Margin` 時刷新
+2. 加 jitter
+3. 使用指數退避
+4. 過期或簽章失敗時 fail-closed
 
-1. 有的 client 會在同一個壞 node 上反覆打不同 endpoint
-2. 有的 client 會過早把整個 node 拉黑
-3. 有的 client 會在同 priority bucket 裡充分探索
-4. 有的 client 會直接升級到下一個 bucket
+這些方向都對，但還不足以讓不同團隊獨立實作後得到相同行為，因為缺少：
 
-在高丟包、局部黑洞、單入口被干擾的環境裡，這些差異會直接決定：
+1. **統一的 verifier clock model**
+2. **時間比較時的 skew tolerance**
+3. **wall clock 與 monotonic clock 的分工**
+4. **當本地時鐘明顯不可信時的強制處置**
 
-1. 連線建立延遲
-2. 控制面壓力
-3. session pool 補連速度
-4. 使用者體感是否像“可用”
+#### 建議的具體演進方向
 
-### 具體修改方案
-這一塊我建議不要再留給實作者自由發揮，直接把 state machine 寫死：
+應在 `control_plane.md` 新增一個專門小節，例如
+`Verifier Time Semantics`，至少寫死以下內容：
 
-1. **Node Selection**
-   - 先取最小 `Node_Priority` bucket
-   - 在 bucket 內按 `Node_Weight` 做 weighted-random
-2. **Endpoint Selection**
-   - 在選中的 `Node_ID` 內取最小 `Endpoint Priority` bucket
-   - 在 bucket 內按 `Weight` 做 weighted-random
-3. **Endpoint Failure**
-   - 單個 endpoint 失敗只暫時排除該 endpoint
-   - 不立即懲罰整個 `Node_ID`
-4. **Node Failure Promotion**
-   - 僅當該 node 在當前嘗試輪次內所有 endpoint 都失敗時，才將該 `Node_ID` 標記為
-     “本輪不可用”，回到同一 `Node_Priority` bucket 繼續選其他 node
-5. **Bucket Escalation**
-   - 只有當某個 `Node_Priority` bucket 的所有 node 都耗盡時，才升到下一個 priority
-6. **Health Cache**
-   - 補一個與 rollover cache 分離的 `Node Health Backoff`
-   - 至少定義：cache key、TTL、失效條件、與 `Node_Weight` 的交互方式
+1. **定義統一常數**
+   - `MAX_VERIFIER_CLOCK_SKEW = 300s`
+   - `MIN_REFRESH_MARGIN = 60s`
+   - `MAX_REFRESH_JITTER_RATIO = 10%`
+   - `MAX_CLOCK_STEP_FORWARD` / `MAX_CLOCK_STEP_BACKWARD`
+     的本地容忍門檻
 
-如果不補這套東西，兩階段調度看起來已經“有算法”，實際上仍然只是半成品。
+2. **定義時間比較公式**
+   - `Realm valid if Now + SKEW >= Issued_At AND Now - SKEW <= Expires_At`
+   - `Credential valid if Now + SKEW >= Not_Before AND Now - SKEW <= Not_After`
+   - 明確寫死 `Issued_At` 與 `Not_Before` 是「可提前接受多少」，
+     `Expires_At` 與 `Not_After` 是「可延後接受多少」
 
----
+3. **定義 clock source**
+   - `wall clock` 用於 UTC validity checks
+   - `monotonic clock` 用於 refresh/backoff timer
+   - 不允許把 retry/backoff 直接綁在可跳變的 wall clock 上
 
-## 1.2 `Auth Realm Manifest` 的生命週期雖然補上了，但 verifier 的刷新狀態機仍然不夠精確，Fail-Closed 很可能在真實運營裡變成同步雪崩
+4. **定義時鐘異常的 fail-closed 行為**
+   - 若本地時間早於某個最小可信值，verifier 必須直接進入 maintenance /
+     unsafe-clock state，而不是繼續服務
+   - 若本地時鐘在短時間內向後跳變超過門檻，必須清空 refresh timer、
+     重新計算 freshness 狀態，必要時暫停接受新 `CLIENT_AUTH`
 
-### 攻擊
-這一輪你們補了 `Issued_At / Expires_At / Realm_Sequence / Fail-Closed`，方向完全正確。
-但新的問題是：一旦 verifier 真的依賴它，**刷新策略本身就變成系統可用性的核心路徑**，
-而現在這條路徑還沒被真正定義。
+5. **重新拆分錯誤映射**
+   - `Credential Not Yet Valid` 應該更像 `[C] verifier clock / config fault`
+     或 `[I] issuer misconfig`
+   - `Credential Expired` 才是明確的授權失敗
+   - 否則 server 目前會把所有這類情況都打包進 `0x05`，這會把
+     verifier clock drift 誤報成 client credential problem
 
-目前還缺的是：
-
-1. verifier 應在什麼時刻開始刷新
-2. 若刷新失敗，多久後重試
-3. 多次失敗時是否退避
-4. 舊的 `Auth Realm Manifest` 能否在未過期前繼續使用
-5. `Realm_Sequence` 的最高值是否必須持久化到磁碟，還是只存在記憶體
-6. verifier 重啟後如何避免被舊 manifest 回放
-
-如果這些不寫死，Fail-Closed 的理論正確性很可能在實務上變成：
-
-1. 大量 verifier 在接近 `Expires_At` 時同時輪詢控制面
-2. 一次控制面抖動導致整片邊緣節點同步失效
-3. 重啟後的 verifier 因為沒有持久化最高 `Realm_Sequence`，接受了舊的 auth realm
-
-### 為什麼目前還不夠
-現在的文檔把“生命週期是否存在”補上了，但還沒有把“生命週期如何運行”補上。
-這對 `Auth Realm` 特別危險，因為它不是純配置，而是：
-
-1. 每次新連線都會走到的 verifier 決策依據
-2. 失效後必須 fail-closed 的關鍵物件
-
-換句話說，它不是邊緣上的“輔助配置”，而是實時 auth gate。
-
-### 具體修改方案
-這一塊建議直接補一個 verifier refresh contract：
-
-1. **Soft Refresh Threshold**
-   - 例如在 `Expires_At - Refresh_Margin` 時主動刷新
-   - `Refresh_Margin` 必須大於最大控制面輪詢抖動
-2. **Refresh Jitter**
-   - verifier 必須加入隨機抖動，避免同時輪詢
-3. **Retry Backoff**
-   - 輪詢失敗後使用指數退避，但不得超過 `Expires_At`
-4. **Fail-Closed Boundary**
-   - 一旦超過 `Expires_At` 且無新 realm，立即拒絕所有新的 `CLIENT_AUTH`
-5. **Sequence Persistence**
-   - verifier 必須持久化已接受的最高 `Realm_Sequence`
-   - 重啟後先載入持久化最高值，再接受新 realm
-6. **Bootstrap Rule**
-   - 冷啟動若沒有任何有效 `Auth Realm Manifest`，必須進入 fail-closed，不得接受 auth
-
-如果不補這一層，你們的 `Auth Realm` 仍然只是“格式正確”，不是“運營可用”。
+如果這一塊不先定死，`Auth Realm` 雖然看起來已經有生命週期，但實際上仍
+然沒有運營上的單一真相。
 
 ---
 
-## 1.3 `Auth Realm Manifest` 現在是單一巨型清單模型，這和你們追求的高效率、面向未來、可擴展，已經開始正面衝突
+### 1.2 `Node Health Backoff Cache` 與 `Current -> Next` fallback 還沒有組合規則
 
-### 攻擊
-v14.0 的 `AuthRealmBody` 本質上仍然是：
+這是本輪第二個阻塞點，而且是純狀態機問題。`control_plane.md`
+現在同時定義了兩套本地決策機制：
 
-1. 一份完整簽名的全量 credential 清單
-2. 任一 credential 狀態變化，都要重發整個清單
+1. **調度失敗回饋**
+   - endpoint failure: 當前輪次排除 endpoint
+   - node failure: 同 node 全部 endpoint 失敗後才標記 node backoff
+   - bucket escalation: 同 priority bucket 全耗盡後才升級
 
-這在小規模環境可以工作，但從設計目標來看，它已經碰到了明顯的效率與擴展性邊界：
+2. **key rollover fallback**
+   - 在 overlap window 內，先試 `Current`
+   - 單一 endpoint 上若出現 timeout / handshake AEAD fail / silent drop，
+     才允許一次 `Current -> Next`
+   - 結果寫入 `Node_ID` 級 cache
 
-1. 一個憑證撤銷，必須重新簽發整份 realm
-2. verifier 每次輪詢都要拉取整份 realm
-3. 記憶體佔用與輪詢帶寬對 credential 數量呈線性增長
-4. `Record_Count` 越大，簽章驗證與反序列化越重
+單獨看兩套都能自圓其說，但規格沒有定義它們怎麼組合。這在 hostile
+network 下會導致非常大的差異。以下是一個真實的分叉場景：
 
-你們現在把 `Auth Realm` 做成了安全上可行的一版，但在規模上還沒有未來性。
+1. client 在 `Route_Group G` 內選到 `Node A`
+2. `Node A` 有 `Endpoint A1`、`Endpoint A2`
+3. `Node A` 在 overlap window 中，`Current` 正在被替換成 `Next`
+4. client 先用 `Current` 撥 `A1`
+5. 結果是 timeout
 
-### 為什麼目前還不夠
-專案目標裡一直有兩個關鍵詞：
+此時至少有四種合理但互相衝突的實作：
 
-1. **整體效率足夠高**
-2. **面向未來**
+1. **實作 A**：先把 `A1` 判為 endpoint failure，再在 `A2` 上繼續試
+   `Current`
+2. **實作 B**：在 `A1` 上立刻做一次 `Current -> Next`
+3. **實作 C**：先把整個 `Node A` 標記為可疑 rollover，之後整個 node
+   一律走 `Next`
+4. **實作 D**：因 timeout 屬於網路噪聲，不立即做 rollover，優先把
+   `A1` 排除、繼續 `A2`
 
-單一全量憑證清單模型，和這兩個目標天然有張力。
+現在規格沒有告訴實作者哪一個才是對的。這不是小差異，因為它直接決定：
 
-尤其當：
+1. key rollover 是否會被普通網路噪聲誤觸發
+2. node health cache 是否會被 key mismatch 污染
+3. 同一 `Node_ID` 內不同 endpoint 是否共享 fallback 決策
+4. `Session Pool` 在 replenish 時是否會沿用錯誤的 node-level cache
 
-1. 憑證數量增加
-2. 撤銷事件頻繁
-3. verifier 節點數量擴大
+#### 為什麼目前寫法仍不夠
 
-控制面更新成本會迅速從“可以接受”變成“每次變更都在推整包”。
+`control_plane.md` 第 2.2 節把所有安全綁定、key rollover、failure cache
+都綁到 `Node_ID`，但沒有給出明確的**決策優先順序**。只靠
+`Cache Key = Node_ID` 還不足以定義行為，因為你仍然要回答：
 
-### 具體修改方案
-這一塊未必要立刻大改，但下一步至少應該選一條演進路線：
+1. 同一 endpoint 上是否要先試 `Next`
+2. 試完 `Next` 失敗後，這次失敗要算 endpoint failure 還是 node failure
+3. 若 `A1` 走 `Next` 成功，`A2` 是否也必須直接切到 `Next`
+4. node health backoff 與 rollover cache 誰先檢查，誰覆蓋誰
 
-1. **Sharded Auth Realm**
-   - 按 `Credential_ID` 前綴或 hash bucket 切 shard
-   - 每個 shard 有自己的 `Shard_Sequence / Issued_At / Expires_At`
-   - verifier 只更新受影響 shard
-2. **Delta + Base Snapshot**
-   - 保留周期性全量 snapshot
-   - 中間發佈簽名的增量變更集
-3. **Per-Record Validity**
-   - 為 `ClientCredentialRecord` 增加 `Not_Before / Not_After`
-   - 降低整份 realm 因單一 credential 到期而頻繁重發的壓力
+#### 建議的具體演進方向
 
-如果你們短期內不想增加太多複雜度，我建議先做最保守的一步：
+應把 `Node_ID` 級 rollover 與 scheduling failure 合併成一張正式表格，
+至少寫死以下狀態機：
 
-1. 保留全量 `AuthRealmBody`
-2. 但為 `ClientCredentialRecord` 增加 `Not_Before / Not_After`
-3. 同時預留未來 shard 化的 `Realm_ID / Shard_ID`
+1. **定義嘗試單元**
+   - 一次 `Dial Attempt` = 對單一 `(Node_ID, Endpoint, KeyChoice)` 的一次
+     物理撥號與完整握手嘗試
+   - 一次 `Node Attempt Round` = 對同一 `Node_ID` 下所有 eligible
+     endpoint 與允許的 key choice 探索完畢的完整過程
 
-這樣至少不會把未來的擴容路徑堵死。
+2. **定義決策順序**
+   - 第一步：根據 rollover cache 決定該 node 的首選 key
+   - 第二步：在該 key 下選 endpoint
+   - 第三步：若該 endpoint 出現 timeout / silent drop / handshake AEAD fail，
+     且當前處於 overlap window，且尚未做過一次 `Current -> Next`，
+     才允許在**同一 endpoint** 上立即重試一次 `Next`
+   - 第四步：只有在 `Current` 與 `Next` 都失敗後，這個 endpoint
+     才能計入 endpoint failure
+   - 第五步：只有當所有 endpoint 都用盡了當前 node 的合法 key path，
+     才能宣告 node failure 並寫入 node health backoff
+
+3. **定義成功後的 cache 覆寫**
+   - 若某 endpoint 用 `Next` 成功，應立即把 `Node_ID` 的 rollover cache
+     設為 `Prefer Next`
+   - 後續同 node 的其他 endpoint 在 TTL 內不得再回頭試 `Current`
+   - 若後續明確有某次 `Current` 成功，才允許覆寫清除 `Prefer Next`
+
+4. **定義 failure classification**
+   - `TCP connect refused / reset` 更像 endpoint reachability fault
+   - `silent drop / handshake timeout / pre-auth AEAD fail` 才是可以參與
+     rollover 推斷的信號
+   - 如果把所有 failure 都一視同仁，rollover cache 就會被普通撥號錯誤污染
+
+5. **定義與 session pool 的關係**
+   - rollover cache 與 node health cache 是否為 process-global
+   - 同一 `Route_Group` 下多個 warm session 是否共享這些 cache
+   - session pool replenishment 是否允許繞過現有 backoff
+
+現在這塊如果不補，`v15.0` 的兩階段調度雖然比 `v14.0` 先進，但仍然不具備
+真正的 deterministic convergence。
+
+---
+
+### 1.3 `0x06 / 0x07` 已引入，但 wire-level 語義仍然分叉
+
+`design.md` 在總結裡宣稱：
+
+1. `0x06` = verifier config lag / out of sync
+2. `0x07` = verifier rollback / security incident
+3. client 應能據此精準決定「切點」還是「停止」
+
+這個方向是正確的，但 `protocol.md` 目前還沒有真正做到。現在至少有三處
+語義不一致：
+
+1. **錯誤碼表**
+   - `0x06`: `Auth Realm Out of Sync / Freshness Lag`
+   - `0x07`: `Auth Realm Rollback Detected / Signature Invalid`
+
+2. **Recovery Matrix**
+   - `Auth Realm Sig Invalid / Expired` -> `GOAWAY (0x06)`
+   - `Auth Realm Rollback Detected` -> `GOAWAY (0x07)`
+
+3. **客戶端恢復策略**
+   - 對 `0x06` 和 `0x07` 都寫成 `Switch Node`
+
+這三者放在一起就裂開了。最明顯的矛盾是：
+
+1. 錯誤碼表說 **signature invalid** 應屬於 `0x07`
+2. recovery matrix 卻把 **Sig Invalid / Expired** 一起映射到 `0x06`
+3. client 行為又把 `0x06` 和 `0x07` 視為同一種恢復建議
+
+這表示目前 `0x06 / 0x07` 雖然存在，但其實還沒形成穩定的 wire contract。
+
+#### 為什麼這個問題是阻塞級
+
+因為這兩個錯誤碼代表兩種完全不同的運營語義：
+
+1. **`0x06` out-of-sync / freshness lag**
+   - 問題可能是單點 verifier 落後
+   - 切到其他 node 有機會恢復
+   - client 可以保守重試
+
+2. **`0x07` rollback / signature invalid**
+   - 這更像 verifier 本地 trust store 污染、控制面簽章鏈異常、
+     或重大安全事件
+   - 若 client 只是盲目 switch node，可能把本地重試放大成全域 storm
+   - 在某些部署模型下，這反而應該觸發 route-group 級 taint
+     或 operator alert
+
+#### 建議的具體演進方向
+
+應把這一塊徹底拆開，不要再混寫：
+
+1. **重新定義 server-side mapping**
+   - `Realm expired but signature valid` -> `0x06`
+   - `Realm not yet refreshed / freshness lag` -> `0x06`
+   - `Realm signature invalid` -> `0x07`
+   - `Realm rollback detected` -> `0x07`
+
+2. **把 `protocol.md` 的 recovery matrix 改成 actor-aware**
+   - `Detected By`
+   - `Classification`
+   - `Local Action`
+   - `Peer-visible Signal`
+   - `Client Retry Scope`
+   現在雖然表頭已經開始 actor-aware，但 `0x06 / 0x07` 的處理仍然把
+   verifier 本地異常和 client retry policy 黏得太死。
+
+3. **分離 client recovery**
+   - `0x06`:
+     `Switch Node` 合理，但必須帶 route-group 內退避與抖動
+   - `0x07`:
+     不應只寫 `Switch Node`
+     應明確規定為：
+     `Taint current route-group / suppress aggressive retries / require control-plane refresh or operator attention`
+
+4. **補一句硬規範**
+   - 任何節點在本地檢測到 `Realm Signature Invalid` 時，
+     不應繼續以普通 out-of-sync node 的身分參與調度
+   - 否則 routing layer 會把安全事件節點和普通 lagging node 等價處理
+
+如果這一塊不修，`0x06 / 0x07` 最後只會變成表面上多了兩個 code，
+實際恢復行為卻仍然和 `v14.0` 沒有本質差別。
 
 ---
 
 ## 2. 高優先級但非阻塞問題
 
-## 2.1 `GOAWAY 0x01` 現在同時承載 generic internal error 與 auth realm verifier failure，對 client 來說過於粗糙
+### 2.1 兩階段調度仍然缺少幾個「算得出來」的細節
 
-### 攻擊
-`protocol.md` 目前把：
+`control_plane.md` 現在已經有 Node/Endpoint 的 `Priority / Weight`，
+這是很大進步，但還差最後幾個會造成實作分叉的邊界：
 
-1. `Auth Realm Sig Invalid / Expired`
-2. `Auth Realm Rollback Detected`
+1. **`current round` 沒有明確定義**
+   - 是一次 session establishment？
+   - 一次 pool replenish？
+   - 還是一次 route-group 級的整體 connect cycle？
 
-都映射到了 `GOAWAY 0x01`。
+2. **`Node_Weight = 0` / `Endpoint Weight = 0` 的語義未定**
+   - 代表不可選？
+   - 代表最低權重但仍可選？
+   - 若一個 bucket 內全部為 0，是否視為配置錯誤？
 
-這雖然比完全沒語義好，但對 client 來說仍然過於粗糙：
+3. **backoff 公式沒有規範化**
+   - 目前只有示例：初始 5s，最大 300s
+   - 缺 multiplier、jitter ratio、reset 條件
 
-1. generic internal error
-2. verifier freshness lag
-3. verifier security incident
+4. **success reset 條件不清楚**
+   - 某 node 在 backoff 後成功一次，是否立即清零 backoff tier？
+   - 還是採用 decay？
 
-都變成同一個 wire-level code。
+#### 建議的具體演進方向
 
-### 具體修改方案
-你們可以不立刻新增很多主錯誤碼，但至少要二選一：
+至少補上以下硬規範：
 
-1. 新增 encrypted `GOAWAY Detail Code`
-2. 或在 `GOAWAY 0x01` 後附一個可選的 detail TLV
+1. `Round = one route-group connection attempt until success or all buckets exhausted`
+2. `Weight = 0` 明確禁止，視為 manifest invalid
+3. `backoff = min(base * 2^n, max) * jitter(0.8..1.2)`
+4. 任一 node 成功完成握手並通過 `CLIENT_AUTH` 後，該 `Node_ID`
+   的 health backoff tier 立即重置
 
-這樣 client / telemetry / operator 才能分辨：
-
-1. 普通內部錯誤
-2. auth realm 未同步
-3. auth realm rollback 安全事件
-
----
-
-## 2.2 `ClientCredentialRecord` 仍然只有 `Status`，沒有單條憑證級的時間語義
-
-### 攻擊
-即便暫時接受全量 `AuthRealmBody`，目前單條 record 仍只有：
-
-1. `Credential_ID`
-2. `Auth_Scheme`
-3. `Client_Public_Key`
-4. `Status`
-
-沒有：
-
-1. `Not_Before`
-2. `Not_After`
-
-這意味著任何憑證有效期管理，都只能透過整份 realm 的替換來完成。
-
-### 具體修改方案
-如果短期內不做 shard / delta，至少把 record 級時間語義補上：
-
-1. `Credential_Not_Before`
-2. `Credential_Not_After`
-
-這可以顯著降低整份 realm 因單一 credential 生命周期變更而頻繁重發的壓力。
+這些看起來像工程細節，但若不寫死，不同 client 之間的流量分佈與故障
+收斂速度會完全不同。
 
 ---
 
-## 2.3 `Node Manifest` 與 `Auth Realm Manifest` 雖然都用了“同樣生命週期語義”的表述，但規格仍然太依賴引用而不是顯式列出
+### 2.2 `Auth Realm` 仍然是單體全量模型，長期效率風險沒有解除
 
-### 攻擊
-`control_plane.md` 現在用一句話說：
-`Auth Realm Manifest` 具有與 `Node Manifest` 完全相同的生命週期與 issuer contract 語義。
+`v15.0` 已經透過 `Not_Before / Not_After` 降低了頻繁重發整份 realm 的
+壓力，但本質上 `AuthRealmBody` 仍然是一個全量簽發、全量輪詢、全量替換
+的模型。這在早期完全可行，但如果專案的設計目標是面向未來、易於優化，
+那就應該及早承認這是未來的壓力點。
 
-這種寫法對人類讀者夠用，但對實作者其實不夠穩：
+#### 問題在哪裡
 
-1. 哪些規則完全相同
-2. 哪些只是概念相同但對象不同
-3. verifier 是否和 client 一樣都必須持久化最高 sequence
+1. 新增一條 credential，要重發整份 realm
+2. 撤銷一條 credential，要重發整份 realm
+3. verifier refresh 時，拿到的是全量快照，不是增量
+4. `Realm_Sequence` 一旦足夠頻繁地遞增，控制面與 verifier 的同步成本
+   會很快從「可以接受」變成「明顯偏重」
 
-這些最好不要靠“類比理解”。
+#### 為什麼這一輪還不用把它當阻塞點
 
-### 具體修改方案
-建議在 `Auth Realm Manifest` 章節下直接顯式列出：
+因為現在最優先的是保證 correctness 與 fail-closed，不是過早優化。
+但應該在文檔裡正式承認這是**下一階段演進方向**，而不是等到實作做大後
+再返工。
 
-1. `Realm_Sequence` 的 anti-rollback
-2. issuer contract
-3. 持久化要求
-4. fail-closed 邊界
+#### 建議的演進方向
 
-即使內容和 `Node Manifest` 重複，也比引用式規範更穩。
+可以先不改現行穩定規格，但在 `control_plane.md` 補一段
+`Future Evolution Notes`，明確列出可接受的升級路徑：
+
+1. **Snapshot + Delta**
+   - 保持全量快照作為基線
+   - 新增 `RealmDelta` 物件承載小變更
+
+2. **Sharded Auth Realm**
+   - 按 `Credential_ID` 前綴或租戶維度切 shard
+   - verifier 只拉自己需要的 shard
+
+3. **Epoch-based Realm Families**
+   - 用 `Realm_ID / Shard_ID / Realm_Sequence`
+     取代單一全域 realm 序列
+
+先把方向寫進去，未來擴展時才不會把現在的 wire semantics 打碎。
 
 ---
 
-## 3. 建議下一輪直接落地的修改順序
+### 2.3 `design.md` 對 v15.0 的總結仍然過度樂觀
 
-如果目標是繼續快收斂，下一輪我建議按這個順序改：
+`design.md` 最後一句說：
+「控制面下發的物件已經具備了完整的、抗噪聲的生命週期與失敗收斂能力。」
 
-1. 先把兩階段調度補成帶 failure feedback / backoff 的正式狀態機
-2. 再把 `Auth Realm` 的 verifier refresh contract 補齊
-3. 再決定 `Auth Realm` 的規模模型是全量 + per-record validity，還是直接走 shard / delta
-4. 之後補 `GOAWAY 0x01` 的 detail semantics
-5. 最後把 `Auth Realm` 與 `Node Manifest` 的共享生命週期規則改成顯式規範，而不是引用式規範
+這句話現在還是說早了。原因不是方向錯，而是上面三個問題都還沒完全閉環：
+
+1. verifier 時間語義未定
+2. rollover 與 node health 的組合狀態機未定
+3. `0x06 / 0x07` 的 wire semantics 仍分叉
+
+建議把這句收斂成更準確的版本，例如：
+
+`v15.0 已經補上控制面生命週期與失敗收斂的主要骨架，
+但 verifier 時間模型、rollover/backoff 組合規則、以及 0x06/0x07 的
+最終語義仍待收斂。`
+
+這不是文字潔癖。設計文檔如果過早宣布閉環，後續 reviewer 和實作者都會
+低估仍然存在的系統風險。
 
 ---
 
-## 4. 本輪結論
+## 3. 建議的下一輪收斂順序
 
-v14.0 不是在修詞，而是真的把上一輪的大部分主問題打掉了。這一點應該正式承認。
+如果要加快迭代，下一輪不應再平均用力，而應按下面順序收斂：
 
-但新的主事實也非常清楚：
+1. **先補 `Verifier Time Semantics`**
+   - 這會同時影響 `Auth Realm`、`ClientCredentialRecord`
+     與 `0x05 / 0x06 / 0x07` 的分類
 
-1. `Node Manifest` 這條線已經接近可以收口
-2. 真正新的瓶頸在於 `Auth Realm` 這條線的運營狀態機與規模模型
-3. 其次是 route selection 從“靜態算法”走向“失敗下可收斂算法”的最後一步
+2. **再補 `Node Backoff x Key Rollover Composition`**
+   - 把 `(Node_ID, Endpoint, KeyChoice)` 的完整狀態機寫成決策順序
 
-把這兩件事做完之後，下一輪 review 才值得真正深入到：
+3. **然後修 `0x06 / 0x07` 的 code table、matrix、client recovery**
+   - 三處一起改，避免再次分叉
 
-1. session pool 的補連策略
-2. mixed workload 下的 HOL 隔離效果
-3. 控制幀優先級與 tail latency 邊界
+4. **最後補 scheduling 精確數值**
+   - round 定義
+   - zero-weight 規則
+   - backoff 公式
+   - reset 條件
+
+5. **把 `Auth Realm` 的擴展路線寫成附錄或 future note**
+   - 不必立刻改 wire format
+   - 但必須明確承認未來演進方向
+
+---
+
+## 4. 總結
+
+`v15.0` 是一個明確前進的版本。現在的主要問題不再是「缺一個物件」，
+而是「多個已經存在的機制尚未組合成唯一行為」。這代表協議正在從概念收斂
+走向真正的可互通實作，但也意味著 reviewer 的要求必須提高：下一輪需要的
+不是再補名詞，而是把狀態機與時間語義寫到不同團隊盲寫仍不會分叉的程度。
+
+如果只看方向，`v15.0` 是正確的；如果看可互通與可運營的精確度，
+它還沒有完工。
